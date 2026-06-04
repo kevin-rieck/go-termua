@@ -126,9 +126,9 @@ func TestAddressSpaceScrollsToSelectedNode(t *testing.T) {
 	model := NewModel(Dependencies{})
 	model.connected = true
 	model.height = 18
-	model.tree = []treeNode{{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}, expanded: true, childrenLoaded: true}}
+	model.addressSpace = &AddressSpace{tree: []treeNode{{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}, expanded: true, childrenLoaded: true}}}
 	for i := 1; i <= 20; i++ {
-		model.tree = append(model.tree, treeNode{
+		model.addressSpace.tree = append(model.addressSpace.tree, treeNode{
 			node:  opcua.AddressNode{NodeID: "i=" + string(rune('a'+i)), DisplayName: fmt.Sprintf("Node%02d", i), NodeClass: "Object"},
 			depth: 1,
 		})
@@ -154,10 +154,10 @@ func TestExpandSelectedNodeBrowsesLazily(t *testing.T) {
 	}}
 	model := NewModel(Dependencies{Client: client})
 	model.connected = true
-	model.tree = []treeNode{
+	model.addressSpace = &AddressSpace{tree: []treeNode{
 		{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}, expanded: true, childrenLoaded: true},
 		{node: opcua.AddressNode{NodeID: "i=2253", DisplayName: "Server", NodeClass: "Object"}, depth: 1},
-	}
+	}}
 	model.selectedTree = 1
 
 	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -177,10 +177,10 @@ func TestWatchlistSubscribesSelectedVariableNode(t *testing.T) {
 	client := &fakeClient{subscriptions: map[string]chan opcua.LiveValue{"ns=2;s=Temperature": updates}}
 	model := NewModel(Dependencies{Client: client})
 	model.connected = true
-	model.tree = []treeNode{
+	model.addressSpace = &AddressSpace{tree: []treeNode{
 		{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}, expanded: true, childrenLoaded: true},
 		{node: opcua.AddressNode{NodeID: "ns=2;s=Temperature", DisplayName: "Temperature", NodeClass: "Variable"}, depth: 1},
-	}
+	}}
 	model.selectedTree = 1
 
 	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
@@ -275,3 +275,4 @@ func (f *fakeClient) Close(ctx context.Context) error { return nil }
 type fakeSubscription struct{}
 
 func (fakeSubscription) Cancel(ctx context.Context) error { return nil }
+

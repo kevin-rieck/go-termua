@@ -58,15 +58,6 @@ type watchValueMsg struct {
 	Err    error
 }
 
-type treeNode struct {
-	node           opcua.AddressNode
-	depth          int
-	expanded       bool
-	childrenLoaded bool
-	loading        bool
-	err            error
-}
-
 type watchItem struct {
 	node         opcua.AddressNode
 	updates      <-chan opcua.LiveValue
@@ -92,7 +83,7 @@ type Model struct {
 	connecting       bool
 	connected        bool
 	details          []string
-	tree             []treeNode
+	addressSpace     *AddressSpace
 	selectedTree     int
 	treeScroll       int
 	watchlist        []watchItem
@@ -127,9 +118,7 @@ func NewModel(deps Dependencies) Model {
 		focus:      focusTree,
 		statusLine: status,
 		details:    details,
-		tree: []treeNode{{
-			node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", BrowseName: "Objects", NodeClass: "Object"},
-		}},
+		addressSpace: NewAddressSpace(),
 	}
 }
 
@@ -331,32 +320,32 @@ func ellipsize(value string, maxLength int) string {
 }
 
 func (m Model) addressSpaceLines(panelHeight int) []string {
-	lines := make([]string, 0, len(m.tree)+4)
-	visible := m.visibleTree()
+	visible := m.addressSpace.View()
+	lines := make([]string, 0, len(visible)+4)
 	treeLines := m.visibleTreeWindow(visible, m.addressTreePageSize(panelHeight))
-	for i, node := range treeLines {
+	for i, item := range treeLines {
 		visibleIndex := m.treeScroll + i
-		indent := strings.Repeat("  ", node.depth)
+		indent := strings.Repeat("  ", item.Depth)
 		marker := " "
 		if visibleIndex == m.selectedTree && m.focus == focusTree {
 			marker = "›"
 		}
 		expander := " "
-		if node.loading {
+		if item.IsLoading {
 			expander = "…"
-		} else if !node.childrenLoaded {
+		} else if !item.ChildrenLoaded {
 			expander = "▸"
-		} else if node.expanded {
+		} else if item.IsExpanded {
 			expander = "▾"
 		} else {
 			expander = "▸"
 		}
-		name := node.node.DisplayName
-		if node.node.NodeClass == "Variable" {
+		name := item.Node.DisplayName
+		if item.Node.NodeClass == "Variable" {
 			name = name + " " + mutedStyle.Render("variable")
 		}
 		line := fmt.Sprintf("%s %s%s%s", marker, indent, expander, name)
-		if node.err != nil {
+		if item.Err != nil {
 			line += " " + mutedStyle.Render("browse failed")
 		}
 		lines = append(lines, line)
@@ -497,13 +486,13 @@ func waitForWatchValueCmd(nodeID string, updates <-chan opcua.LiveValue) tea.Cmd
 }
 
 func (m *Model) moveTreeSelection(delta int) {
-	visible := m.visibleTree()
+	visible := m.addressSpace.View()
 	if len(visible) == 0 {
 		return
 	}
 	m.selectedTree = (m.selectedTree + delta + len(visible)) % len(visible)
 	m.ensureSelectedTreeVisible(len(visible), m.addressTreePageSize(m.mainPanelHeight()))
-	m.details = nodeDetailLines(visible[m.selectedTree].node)
+	m.details = nodeDetailLines(visible[m.selectedTree].Node)
 }
 
 func (m *Model) moveWatchSelection(delta int) {
@@ -517,51 +506,44 @@ func (m *Model) moveWatchSelection(delta int) {
 }
 
 func (m *Model) expandSelectedNode() tea.Cmd {
-	if !m.connected || m.client == nil || len(m.tree) == 0 {
+	if !m.connected || m.client == nil {
 		return nil
 	}
-	idx := m.selectedTreeIndex()
-	if idx < 0 {
+	visible := m.addressSpace.View()
+	if m.selectedTree < 0 || m.selectedTree >= len(visible) {
 		return nil
 	}
-	if m.tree[idx].loading {
-		return nil
+	item := visible[m.selectedTree]
+	needsFetch := m.addressSpace.Toggle(item.Node.NodeID)
+	if needsFetch {
+		m.statusLine = "Read-Only Mode · browsing Address Space"
+		return browseChildrenCmd(m.client, item.Node.NodeID)
 	}
-	if m.tree[idx].childrenLoaded {
-		m.tree[idx].expanded = true
-		return nil
-	}
-	return m.startBrowse(m.tree[idx].node.NodeID)
+	return nil
 }
 
 func (m *Model) startBrowse(nodeID string) tea.Cmd {
-	idx := m.treeIndexByNodeID(nodeID)
-	if idx < 0 {
-		return nil
-	}
-	m.tree[idx].loading = true
-	m.tree[idx].err = nil
+	m.addressSpace.MarkLoading(nodeID)
 	m.statusLine = "Read-Only Mode · browsing Address Space"
 	return browseChildrenCmd(m.client, nodeID)
 }
 
 func (m *Model) collapseSelectedNode() {
-	idx := m.selectedTreeIndex()
-	if idx < 0 || !m.tree[idx].childrenLoaded {
-		return
+	visible := m.addressSpace.View()
+	if m.selectedTree >= 0 && m.selectedTree < len(visible) {
+		m.addressSpace.Collapse(visible[m.selectedTree].Node.NodeID)
 	}
-	m.tree[idx].expanded = false
 }
 
 func (m *Model) addSelectedNodeToWatchlist() tea.Cmd {
 	if !m.connected || m.client == nil {
 		return nil
 	}
-	idx := m.selectedTreeIndex()
-	if idx < 0 {
+	visible := m.addressSpace.View()
+	if m.selectedTree < 0 || m.selectedTree >= len(visible) {
 		return nil
 	}
-	node := m.tree[idx].node
+	node := visible[m.selectedTree].Node
 	if node.NodeClass != "Variable" {
 		m.statusLine = "Read-Only Mode · select a Variable Node to watch"
 		return nil
@@ -622,32 +604,21 @@ func (m Model) watchIndexByNodeID(nodeID string) int {
 }
 
 func (m *Model) applyBrowseResult(msg browseChildrenMsg) {
-	idx := m.treeIndexByNodeID(msg.ParentNodeID)
-	if idx < 0 {
-		return
-	}
-	m.tree[idx].loading = false
+	m.addressSpace.ApplyChildren(msg.ParentNodeID, msg.Children, msg.Err)
 	if msg.Err != nil {
 		log.Printf("address space browse failed: parentNodeID=%s error=%v", msg.ParentNodeID, msg.Err)
-		m.tree[idx].err = msg.Err
 		m.statusLine = "Read-Only Mode · browse failed"
-		m.details = append(nodeDetailLines(m.tree[idx].node), "", "Browse failed.", msg.Err.Error())
+		if node, ok := m.addressSpace.Node(msg.ParentNodeID); ok {
+			m.details = append(nodeDetailLines(node), "", "Browse failed.", msg.Err.Error())
+		}
 		return
 	}
 
-	children := make([]treeNode, 0, len(msg.Children))
-	for _, child := range msg.Children {
-		if child.NodeID == "" {
-			continue
-		}
-		children = append(children, treeNode{node: child, depth: m.tree[idx].depth + 1})
+	m.ensureSelectedTreeVisible(len(m.addressSpace.View()), m.addressTreePageSize(m.mainPanelHeight()))
+	m.statusLine = fmt.Sprintf("Read-Only Mode · browsed %d child node(s)", len(msg.Children))
+	if node, ok := m.addressSpace.Node(msg.ParentNodeID); ok {
+		m.details = append(nodeDetailLines(node), "", fmt.Sprintf("Children loaded: %d", len(msg.Children)))
 	}
-	m.tree[idx].childrenLoaded = true
-	m.tree[idx].expanded = true
-	m.tree = insertTreeChildren(m.tree, idx, children)
-	m.ensureSelectedTreeVisible(len(m.visibleTree()), m.addressTreePageSize(m.mainPanelHeight()))
-	m.statusLine = fmt.Sprintf("Read-Only Mode · browsed %d child node(s)", len(children))
-	m.details = append(nodeDetailLines(m.tree[idx].node), "", fmt.Sprintf("Children loaded: %d", len(children)))
 }
 
 func (m *Model) ensureSelectedTreeVisible(total int, pageSize int) {
@@ -715,7 +686,7 @@ func (m *Model) ensureSelectedWatchVisible(pageSize int) {
 	}
 }
 
-func (m Model) visibleTreeWindow(visible []treeNode, pageSize int) []treeNode {
+func (m Model) visibleTreeWindow(visible []ViewItem, pageSize int) []ViewItem {
 	if pageSize < 1 {
 		pageSize = 1
 	}
@@ -752,67 +723,6 @@ func (m Model) addressTreePageSize(panelHeight int) int {
 		return 1
 	}
 	return pageSize
-}
-
-func (m Model) visibleTree() []treeNode {
-	visible := make([]treeNode, 0, len(m.tree))
-	hiddenBelowDepth := -1
-	for _, node := range m.tree {
-		if hiddenBelowDepth >= 0 {
-			if node.depth > hiddenBelowDepth {
-				continue
-			}
-			hiddenBelowDepth = -1
-		}
-		visible = append(visible, node)
-		if !node.expanded {
-			hiddenBelowDepth = node.depth
-		}
-	}
-	return visible
-}
-
-func (m Model) selectedTreeIndex() int {
-	visibleIndex := 0
-	hiddenBelowDepth := -1
-	for i, node := range m.tree {
-		if hiddenBelowDepth >= 0 {
-			if node.depth > hiddenBelowDepth {
-				continue
-			}
-			hiddenBelowDepth = -1
-		}
-		if visibleIndex == m.selectedTree {
-			return i
-		}
-		visibleIndex++
-		if !node.expanded {
-			hiddenBelowDepth = node.depth
-		}
-	}
-	return -1
-}
-
-func (m Model) treeIndexByNodeID(nodeID string) int {
-	for i, node := range m.tree {
-		if node.node.NodeID == nodeID {
-			return i
-		}
-	}
-	return -1
-}
-
-func insertTreeChildren(tree []treeNode, parentIndex int, children []treeNode) []treeNode {
-	parentDepth := tree[parentIndex].depth
-	end := parentIndex + 1
-	for end < len(tree) && tree[end].depth > parentDepth {
-		end++
-	}
-	result := make([]treeNode, 0, len(tree)-(end-parentIndex-1)+len(children))
-	result = append(result, tree[:parentIndex+1]...)
-	result = append(result, children...)
-	result = append(result, tree[end:]...)
-	return result
 }
 
 func nodeDetailLines(node opcua.AddressNode) []string {
@@ -1027,3 +937,4 @@ var (
 			Padding(1, 2).
 			Width(52)
 )
+
