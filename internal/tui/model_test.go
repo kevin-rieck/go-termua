@@ -13,6 +13,21 @@ import (
 	"termua/internal/opcua"
 )
 
+func runCmds(cmd tea.Cmd) []tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+	msg := cmd()
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		messages := make([]tea.Msg, 0, len(batch))
+		for _, batchedCmd := range batch {
+			messages = append(messages, batchedCmd())
+		}
+		return messages
+	}
+	return []tea.Msg{msg}
+}
+
 func TestInitialViewShowsReadOnlyMode(t *testing.T) {
 	model := NewModel(Dependencies{Paths: config.Paths{ConfigDir: "config", CacheDir: "cache"}})
 	view := model.View()
@@ -225,17 +240,67 @@ func TestSelectedVariableNodeSubscribesLiveValueIntoDetails(t *testing.T) {
 		t.Fatalf("selected value = %#v", model.selectedValue)
 	}
 
-	updated, cmd = model.Update(cmd())
-	model = updated.(Model)
-	if cmd == nil {
+	var waitCmd tea.Cmd
+	for _, msg := range runCmds(cmd) {
+		updated, waitCmd = model.Update(msg)
+		model = updated.(Model)
+		if waitCmd != nil {
+			break
+		}
+	}
+	if waitCmd == nil {
 		t.Fatal("expected wait-for-selected-value command")
 	}
 
 	updates <- opcua.LiveValue{NodeID: "ns=2;s=Pressure", Value: "12.3", Status: "StatusOK"}
-	updated, _ = model.Update(cmd())
+	updated, _ = model.Update(waitCmd())
 	view := updated.(Model).View()
 	if !strings.Contains(view, "Pressure") || !strings.Contains(view, "Value") || !strings.Contains(view, "12.3") || !strings.Contains(view, "Health") {
 		t.Fatalf("expected selected Live Value in details:\n%s", view)
+	}
+}
+
+func TestSelectedVariableNodeShowsMetadataAndOutOfRange(t *testing.T) {
+	updates := make(chan opcua.LiveValue, 1)
+	client := &fakeClient{
+		subscriptions: map[string]chan opcua.LiveValue{"ns=2;s=Level": updates},
+		details: map[string]opcua.NodeDetails{"ns=2;s=Level": {
+			DataType:        "Double",
+			AccessLevel:     "CurrentRead, CurrentWrite",
+			Writable:        true,
+			EngineeringUnit: "%",
+			EURange:         &opcua.ValueRange{Low: 0, High: 100},
+		}},
+	}
+	model := NewModel(Dependencies{Client: client})
+	model.connected = true
+	model.addressSpace = &AddressSpace{tree: []treeNode{
+		{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}, expanded: true, childrenLoaded: true},
+		{node: opcua.AddressNode{NodeID: "ns=2;s=Level", DisplayName: "Level", NodeClass: "Variable"}, depth: 1},
+	}}
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(Model)
+	var waitCmd tea.Cmd
+	for _, msg := range runCmds(cmd) {
+		var nextCmd tea.Cmd
+		updated, nextCmd = model.Update(msg)
+		model = updated.(Model)
+		if nextCmd != nil {
+			waitCmd = nextCmd
+		}
+	}
+	if waitCmd == nil {
+		t.Fatal("expected wait-for-selected-value command")
+	}
+	updates <- opcua.LiveValue{NodeID: "ns=2;s=Level", Value: "120", Status: "StatusOK"}
+	updated, _ = model.Update(waitCmd())
+	details := strings.Join(updated.(Model).details, "\n")
+
+	for _, expected := range []string{"Data Type", "Double", "Engineering Unit", "%", "EURange", "0…100", "Out-of-Range", "120 is above 100", "Read-Only Mode prevents writes"} {
+		if !strings.Contains(details, expected) {
+			t.Fatalf("expected %q in selected node details:\n%s", expected, details)
+		}
 	}
 }
 
@@ -308,6 +373,7 @@ type fakeClient struct {
 	endpoints     []opcua.Endpoint
 	connected     opcua.ConnectRequest
 	children      map[string][]opcua.AddressNode
+	details       map[string]opcua.NodeDetails
 	subscriptions map[string]chan opcua.LiveValue
 }
 
@@ -323,6 +389,10 @@ func (f *fakeClient) Connect(ctx context.Context, request opcua.ConnectRequest) 
 
 func (f *fakeClient) BrowseChildren(ctx context.Context, nodeID string) ([]opcua.AddressNode, error) {
 	return f.children[nodeID], nil
+}
+
+func (f *fakeClient) ReadNodeDetails(ctx context.Context, nodeID string) (opcua.NodeDetails, error) {
+	return f.details[nodeID], nil
 }
 
 func (f *fakeClient) SubscribeValue(ctx context.Context, nodeID string) (<-chan opcua.LiveValue, opcua.ValueSubscription, error) {

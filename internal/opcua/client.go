@@ -21,6 +21,7 @@ type Client interface {
 	DiscoverEndpoints(ctx context.Context, endpoint string) ([]Endpoint, error)
 	Connect(ctx context.Context, request ConnectRequest) error
 	BrowseChildren(ctx context.Context, nodeID string) ([]AddressNode, error)
+	ReadNodeDetails(ctx context.Context, nodeID string) (NodeDetails, error)
 	SubscribeValue(ctx context.Context, nodeID string) (<-chan LiveValue, ValueSubscription, error)
 	Close(ctx context.Context) error
 }
@@ -65,6 +66,24 @@ type LiveValue struct {
 	Status          string
 	SourceTimestamp time.Time
 	ServerTimestamp time.Time
+}
+
+type ValueRange struct {
+	Low  float64
+	High float64
+}
+
+type NodeDetails struct {
+	NodeID          string
+	Description     string
+	DataType        string
+	AccessLevel     string
+	Writable        bool
+	ValueRank       string
+	ArrayDimensions string
+	EngineeringUnit string
+	EURange         *ValueRange
+	InstrumentRange *ValueRange
 }
 
 type AuthType string
@@ -182,6 +201,34 @@ func (c *gopcuaClient) BrowseChildren(ctx context.Context, nodeID string) ([]Add
 	return nodes, nil
 }
 
+func (c *gopcuaClient) ReadNodeDetails(ctx context.Context, nodeID string) (NodeDetails, error) {
+	if c.client == nil {
+		return NodeDetails{}, ua.StatusBadServerNotConnected
+	}
+	parsedNodeID, err := ua.ParseNodeID(nodeID)
+	if err != nil {
+		return NodeDetails{}, err
+	}
+
+	node := c.client.Node(parsedNodeID)
+	details := NodeDetails{NodeID: nodeID}
+	attrs, err := node.Attributes(ctx,
+		ua.AttributeIDDescription,
+		ua.AttributeIDAccessLevel,
+		ua.AttributeIDDataType,
+		ua.AttributeIDValueRank,
+		ua.AttributeIDArrayDimensions,
+	)
+	if err != nil {
+		return NodeDetails{}, err
+	}
+	applyNodeDetailAttributes(&details, attrs)
+	if err := c.applyNodeDetailProperties(ctx, node, &details); err != nil {
+		log.Printf("opcua: ReadNodeDetails properties failed nodeID=%s error=%v", nodeID, err)
+	}
+	return details, nil
+}
+
 func (c *gopcuaClient) SubscribeValue(ctx context.Context, nodeID string) (<-chan LiveValue, ValueSubscription, error) {
 	if c.client == nil {
 		return nil, nil, ua.StatusBadServerNotConnected
@@ -250,6 +297,56 @@ func forwardValueNotifications(nodeID string, notifyCh <-chan *gopcua.PublishNot
 	}
 }
 
+func applyNodeDetailAttributes(details *NodeDetails, attrs []*ua.DataValue) {
+	if len(attrs) < 5 {
+		return
+	}
+	if attrs[0] != nil && attrs[0].Status == ua.StatusOK && attrs[0].Value != nil {
+		details.Description = localizedTextValue(attrs[0].Value.Value())
+	}
+	if attrs[1] != nil && attrs[1].Status == ua.StatusOK && attrs[1].Value != nil {
+		access := ua.AccessLevelType(attrs[1].Value.Int())
+		details.AccessLevel = accessLevelText(access)
+		details.Writable = access&ua.AccessLevelTypeCurrentWrite == ua.AccessLevelTypeCurrentWrite
+	}
+	if attrs[2] != nil && attrs[2].Status == ua.StatusOK && attrs[2].Value != nil {
+		details.DataType = dataTypeName(attrs[2].Value.NodeID())
+	}
+	if attrs[3] != nil && attrs[3].Status == ua.StatusOK && attrs[3].Value != nil {
+		details.ValueRank = valueRankText(int32(attrs[3].Value.Int()))
+	}
+	if attrs[4] != nil && attrs[4].Status == ua.StatusOK && attrs[4].Value != nil {
+		details.ArrayDimensions = fmt.Sprint(attrs[4].Value.Value())
+	}
+}
+
+func (c *gopcuaClient) applyNodeDetailProperties(ctx context.Context, node *gopcua.Node, details *NodeDetails) error {
+	refs, err := node.References(ctx, id.HasProperty, ua.BrowseDirectionForward, ua.NodeClassVariable, true)
+	if err != nil {
+		return err
+	}
+	for _, ref := range refs {
+		property := addressNodeFromReference(ref)
+		propertyNodeID, err := ua.ParseNodeID(property.NodeID)
+		if err != nil {
+			continue
+		}
+		value, err := c.client.Node(propertyNodeID).Attribute(ctx, ua.AttributeIDValue)
+		if err != nil || value == nil {
+			continue
+		}
+		switch strings.TrimPrefix(property.BrowseName, "0:") {
+		case "EngineeringUnits":
+			details.EngineeringUnit = engineeringUnitText(value.Value())
+		case "EURange":
+			details.EURange = rangeValue(value.Value())
+		case "InstrumentRange":
+			details.InstrumentRange = rangeValue(value.Value())
+		}
+	}
+	return nil
+}
+
 func liveValueFromDataValue(nodeID string, data *ua.DataValue) LiveValue {
 	value := "<nil>"
 	status := "Unknown"
@@ -297,6 +394,124 @@ func addressNodeFromReference(ref *ua.ReferenceDescription) AddressNode {
 
 func nodeClassName(value string) string {
 	return strings.TrimPrefix(value, "NodeClass")
+}
+
+func localizedTextValue(value any) string {
+	switch v := value.(type) {
+	case *ua.LocalizedText:
+		if v == nil {
+			return ""
+		}
+		return v.Text
+	case ua.LocalizedText:
+		return v.Text
+	default:
+		return fmt.Sprint(value)
+	}
+}
+
+func accessLevelText(access ua.AccessLevelType) string {
+	var parts []string
+	if access&ua.AccessLevelTypeCurrentRead == ua.AccessLevelTypeCurrentRead {
+		parts = append(parts, "CurrentRead")
+	}
+	if access&ua.AccessLevelTypeCurrentWrite == ua.AccessLevelTypeCurrentWrite {
+		parts = append(parts, "CurrentWrite")
+	}
+	if len(parts) == 0 {
+		return "None"
+	}
+	return strings.Join(parts, ", ")
+}
+
+func valueRankText(rank int32) string {
+	switch rank {
+	case -3:
+		return "Scalar or one-dimensional array"
+	case -2:
+		return "Any"
+	case -1:
+		return "Scalar"
+	case 0:
+		return "One or more dimensions"
+	case 1:
+		return "One-dimensional array"
+	default:
+		return fmt.Sprintf("%d dimensions", rank)
+	}
+}
+
+func dataTypeName(nodeID *ua.NodeID) string {
+	if nodeID == nil {
+		return ""
+	}
+	if nodeID.Namespace() != 0 {
+		return nodeID.String()
+	}
+	switch nodeID.IntID() {
+	case id.Boolean:
+		return "Boolean"
+	case id.SByte:
+		return "SByte"
+	case id.Byte:
+		return "Byte"
+	case id.Int16:
+		return "Int16"
+	case id.UInt16:
+		return "UInt16"
+	case id.Int32:
+		return "Int32"
+	case id.UInt32:
+		return "UInt32"
+	case id.Int64:
+		return "Int64"
+	case id.UInt64:
+		return "UInt64"
+	case id.Float:
+		return "Float"
+	case id.Double:
+		return "Double"
+	case id.String:
+		return "String"
+	case id.DateTime, id.UtcTime:
+		return "DateTime"
+	default:
+		return nodeID.String()
+	}
+}
+
+func engineeringUnitText(value any) string {
+	switch v := value.(type) {
+	case *ua.EUInformation:
+		if v == nil {
+			return ""
+		}
+		if v.DisplayName != nil && v.DisplayName.Text != "" {
+			return v.DisplayName.Text
+		}
+		return fmt.Sprintf("unit %d", v.UnitID)
+	case ua.EUInformation:
+		if v.DisplayName != nil && v.DisplayName.Text != "" {
+			return v.DisplayName.Text
+		}
+		return fmt.Sprintf("unit %d", v.UnitID)
+	default:
+		return fmt.Sprint(value)
+	}
+}
+
+func rangeValue(value any) *ValueRange {
+	switch v := value.(type) {
+	case *ua.Range:
+		if v == nil {
+			return nil
+		}
+		return &ValueRange{Low: v.Low, High: v.High}
+	case ua.Range:
+		return &ValueRange{Low: v.Low, High: v.High}
+	default:
+		return nil
+	}
 }
 
 func endpointFromDescription(ep *ua.EndpointDescription) Endpoint {

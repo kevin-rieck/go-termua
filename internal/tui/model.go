@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -71,6 +72,12 @@ type selectedValueMsg struct {
 	Err    error
 }
 
+type selectedNodeDetailsMsg struct {
+	NodeID  string
+	Details opcua.NodeDetails
+	Err     error
+}
+
 type watchItem struct {
 	node         opcua.AddressNode
 	updates      <-chan opcua.LiveValue
@@ -82,13 +89,16 @@ type watchItem struct {
 }
 
 type selectedValueState struct {
-	node         opcua.AddressNode
-	updates      <-chan opcua.LiveValue
-	subscription opcua.ValueSubscription
-	value        opcua.LiveValue
-	subscribing  bool
-	err          error
-	stale        bool
+	node           opcua.AddressNode
+	updates        <-chan opcua.LiveValue
+	subscription   opcua.ValueSubscription
+	value          opcua.LiveValue
+	details        opcua.NodeDetails
+	subscribing    bool
+	loadingDetails bool
+	err            error
+	detailsErr     error
+	stale          bool
 }
 
 type Model struct {
@@ -242,6 +252,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.applySelectedValueSubscribed(msg)
 	case selectedValueMsg:
 		return m.applySelectedValue(msg)
+	case selectedNodeDetailsMsg:
+		return m.applySelectedNodeDetails(msg)
 	}
 	return m, nil
 }
@@ -528,6 +540,17 @@ func subscribeSelectedValueCmd(client opcua.Client, nodeID string) tea.Cmd {
 	}
 }
 
+func readSelectedNodeDetailsCmd(client opcua.Client, nodeID string) tea.Cmd {
+	return func() tea.Msg {
+		log.Printf("selected-node details started: nodeID=%s", nodeID)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		details, err := client.ReadNodeDetails(ctx, nodeID)
+		return selectedNodeDetailsMsg{NodeID: nodeID, Details: details, Err: err}
+	}
+}
+
 func waitForSelectedValueCmd(nodeID string, updates <-chan opcua.LiveValue) tea.Cmd {
 	return func() tea.Msg {
 		value, ok := <-updates
@@ -669,13 +692,14 @@ func (m *Model) selectNode(node opcua.AddressNode) tea.Cmd {
 	}
 	cancel := m.cancelSelectedValue()
 	subscribe := subscribeSelectedValueCmd(m.client, node.NodeID)
-	m.selectedValue = selectedValueState{node: node, subscribing: true}
+	readDetails := readSelectedNodeDetailsCmd(m.client, node.NodeID)
+	m.selectedValue = selectedValueState{node: node, subscribing: true, loadingDetails: true}
 	m.details = liveValueDetailLines(m.selectedValue)
 	m.statusLine = "Read-Only Mode · loading selected Live Value"
 	if cancel == nil {
-		return subscribe
+		return tea.Batch(subscribe, readDetails)
 	}
-	return tea.Batch(cancel, subscribe)
+	return tea.Batch(cancel, subscribe, readDetails)
 }
 
 func (m *Model) cancelSelectedValue() tea.Cmd {
@@ -732,6 +756,21 @@ func (m Model) applySelectedValue(msg selectedValueMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	return m, waitForSelectedValueCmd(msg.NodeID, m.selectedValue.updates)
+}
+
+func (m Model) applySelectedNodeDetails(msg selectedNodeDetailsMsg) (tea.Model, tea.Cmd) {
+	if m.selectedValue.node.NodeID != msg.NodeID {
+		return m, nil
+	}
+	m.selectedValue.loadingDetails = false
+	if msg.Err != nil {
+		m.selectedValue.detailsErr = msg.Err
+		m.details = liveValueDetailLines(m.selectedValue)
+		return m, nil
+	}
+	m.selectedValue.details = msg.Details
+	m.details = liveValueDetailLines(m.selectedValue)
+	return m, nil
 }
 
 func (m Model) watchIndexByNodeID(nodeID string) int {
@@ -891,27 +930,89 @@ func liveValueDetailLines(state selectedValueState) []string {
 		return append(lines, status+": "+state.err.Error())
 	}
 	if state.subscribing {
-		return append(lines, "Subscribing to selected Variable Node…")
-	}
-	if state.value.Value == "" {
-		return append(lines, "Waiting for first Live Value…")
+		lines = append(lines, "Subscribing to selected Variable Node…")
+	} else if state.value.Value == "" {
+		lines = append(lines, "Waiting for first Live Value…")
+	} else {
+		lines = append(lines,
+			labelStyle.Render("Value")+": "+state.value.Value,
+			labelStyle.Render("Health")+": "+compactStatus(state.value.Status),
+		)
+		if outOfRange, ok := outOfRangeText(state.value.Value, state.details.EURange); ok {
+			lines = append(lines, labelStyle.Render("Out-of-Range")+": "+outOfRange)
+		}
+		if !state.value.SourceTimestamp.IsZero() {
+			lines = append(lines, labelStyle.Render("Source Timestamp")+": "+state.value.SourceTimestamp.Local().Format(time.RFC3339))
+			lines = append(lines, labelStyle.Render("Age")+": "+compactAge(time.Since(state.value.SourceTimestamp)))
+		}
+		if !state.value.ServerTimestamp.IsZero() {
+			lines = append(lines, labelStyle.Render("Server Timestamp")+": "+state.value.ServerTimestamp.Local().Format(time.RFC3339))
+		}
+		if state.stale {
+			lines = append(lines, "", "Stale Value: subscription is no longer active.")
+		}
 	}
 
-	lines = append(lines,
-		labelStyle.Render("Value")+": "+state.value.Value,
-		labelStyle.Render("Health")+": "+compactStatus(state.value.Status),
-	)
-	if !state.value.SourceTimestamp.IsZero() {
-		lines = append(lines, labelStyle.Render("Source Timestamp")+": "+state.value.SourceTimestamp.Local().Format(time.RFC3339))
-		lines = append(lines, labelStyle.Render("Age")+": "+compactAge(time.Since(state.value.SourceTimestamp)))
+	lines = append(lines, "", labelStyle.Render("Metadata"))
+	if state.loadingDetails {
+		return append(lines, "Loading Variable Node metadata…")
 	}
-	if !state.value.ServerTimestamp.IsZero() {
-		lines = append(lines, labelStyle.Render("Server Timestamp")+": "+state.value.ServerTimestamp.Local().Format(time.RFC3339))
+	if state.detailsErr != nil {
+		return append(lines, "Metadata unavailable: "+state.detailsErr.Error())
 	}
-	if state.stale {
-		lines = append(lines, "", "Stale Value: subscription is no longer active.")
+	return append(lines, nodeMetadataLines(state.details)...)
+}
+
+func nodeMetadataLines(details opcua.NodeDetails) []string {
+	var lines []string
+	appendIfSet := func(label string, value string) {
+		if value != "" {
+			lines = append(lines, labelStyle.Render(label)+": "+value)
+		}
+	}
+	appendIfSet("Data Type", details.DataType)
+	appendIfSet("Access Level", details.AccessLevel)
+	if details.AccessLevel != "" {
+		lines = append(lines, labelStyle.Render("Writable")+": "+fmt.Sprintf("%t", details.Writable)+" (Read-Only Mode prevents writes)")
+	}
+	appendIfSet("Value Rank", details.ValueRank)
+	appendIfSet("Array Dimensions", details.ArrayDimensions)
+	appendIfSet("Engineering Unit", details.EngineeringUnit)
+	if details.EURange != nil {
+		lines = append(lines, labelStyle.Render("EURange")+": "+formatRange(details.EURange))
+	}
+	if details.InstrumentRange != nil {
+		lines = append(lines, labelStyle.Render("InstrumentRange")+": "+formatRange(details.InstrumentRange))
+	}
+	appendIfSet("Description", details.Description)
+	if len(lines) == 0 {
+		return []string{"No Variable Node metadata exposed."}
 	}
 	return lines
+}
+
+func formatRange(valueRange *opcua.ValueRange) string {
+	if valueRange == nil {
+		return ""
+	}
+	return fmt.Sprintf("%g…%g", valueRange.Low, valueRange.High)
+}
+
+func outOfRangeText(value string, valueRange *opcua.ValueRange) (string, bool) {
+	if valueRange == nil {
+		return "", false
+	}
+	numeric, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	if err != nil {
+		return "", false
+	}
+	if numeric < valueRange.Low {
+		return fmt.Sprintf("%g is below %g", numeric, valueRange.Low), true
+	}
+	if numeric > valueRange.High {
+		return fmt.Sprintf("%g is above %g", numeric, valueRange.High), true
+	}
+	return "", false
 }
 
 func compactAge(age time.Duration) string {
