@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -118,6 +119,32 @@ func TestConnectedEndpointBrowsesObjectsRoot(t *testing.T) {
 	view := updated.(Model).View()
 	if !strings.Contains(view, "Server") {
 		t.Fatalf("expected browsed child in view:\n%s", view)
+	}
+}
+
+func TestAddressSpaceScrollsToSelectedNode(t *testing.T) {
+	model := NewModel(Dependencies{})
+	model.connected = true
+	model.height = 18
+	model.tree = []treeNode{{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}, expanded: true, childrenLoaded: true}}
+	for i := 1; i <= 20; i++ {
+		model.tree = append(model.tree, treeNode{
+			node:  opcua.AddressNode{NodeID: "i=" + string(rune('a'+i)), DisplayName: fmt.Sprintf("Node%02d", i), NodeClass: "Object"},
+			depth: 1,
+		})
+	}
+
+	updated := tea.Model(model)
+	for i := 0; i < 12; i++ {
+		updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyDown})
+	}
+	view := updated.(Model).View()
+
+	if !strings.Contains(view, "Node12") {
+		t.Fatalf("expected selected node to scroll into view:\n%s", view)
+	}
+	if strings.Contains(view, "Node01") {
+		t.Fatalf("expected early nodes to scroll out of view:\n%s", view)
 	}
 }
 

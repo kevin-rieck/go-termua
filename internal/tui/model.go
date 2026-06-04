@@ -71,6 +71,7 @@ type Model struct {
 	details          []string
 	tree             []treeNode
 	selectedTree     int
+	treeScroll       int
 }
 
 func NewModel(deps Dependencies) Model {
@@ -199,13 +200,13 @@ func (m Model) View() string {
 		rightWidth = 38
 		leftWidth = innerWidth - gap - rightWidth
 	}
-	mainHeight := clamp(m.height-9, 12, 24)
+	mainHeight := m.mainPanelHeight()
 	watchHeight := 6
 	if mainHeight < 16 {
 		watchHeight = 4
 	}
 
-	left := m.panel("Address Space", m.addressSpaceLines(), leftWidth, mainHeight, m.focus == focusTree)
+	left := m.panel("Address Space", m.addressSpaceLines(mainHeight), leftWidth, mainHeight, m.focus == focusTree)
 	right := m.panel("Node Details", m.details, rightWidth, mainHeight, m.focus == focusDetails)
 	watchlist := m.panel("Watchlist", []string{"No Variable Nodes added yet.", "Select a Variable Node and press w to keep its Live Value visible."}, innerWidth, watchHeight, m.focus == focusWatchlist)
 
@@ -218,13 +219,15 @@ func (m Model) View() string {
 	return m.frame(body)
 }
 
-func (m Model) addressSpaceLines() []string {
+func (m Model) addressSpaceLines(panelHeight int) []string {
 	lines := make([]string, 0, len(m.tree)+4)
 	visible := m.visibleTree()
-	for i, node := range visible {
+	treeLines := m.visibleTreeWindow(visible, m.addressTreePageSize(panelHeight))
+	for i, node := range treeLines {
+		visibleIndex := m.treeScroll + i
 		indent := strings.Repeat("  ", node.depth)
 		marker := " "
-		if i == m.selectedTree && m.focus == focusTree {
+		if visibleIndex == m.selectedTree && m.focus == focusTree {
 			marker = "›"
 		}
 		expander := " "
@@ -365,6 +368,7 @@ func (m *Model) moveTreeSelection(delta int) {
 		return
 	}
 	m.selectedTree = (m.selectedTree + delta + len(visible)) % len(visible)
+	m.ensureSelectedTreeVisible(len(visible), m.addressTreePageSize(m.mainPanelHeight()))
 	m.details = nodeDetailLines(visible[m.selectedTree].node)
 }
 
@@ -429,8 +433,73 @@ func (m *Model) applyBrowseResult(msg browseChildrenMsg) {
 	m.tree[idx].childrenLoaded = true
 	m.tree[idx].expanded = true
 	m.tree = insertTreeChildren(m.tree, idx, children)
+	m.ensureSelectedTreeVisible(len(m.visibleTree()), m.addressTreePageSize(m.mainPanelHeight()))
 	m.statusLine = fmt.Sprintf("Read-Only Mode · browsed %d child node(s)", len(children))
 	m.details = append(nodeDetailLines(m.tree[idx].node), "", fmt.Sprintf("Children loaded: %d", len(children)))
+}
+
+func (m *Model) ensureSelectedTreeVisible(total int, pageSize int) {
+	if total <= 0 {
+		m.treeScroll = 0
+		return
+	}
+	if pageSize < 1 {
+		pageSize = 1
+	}
+	if m.selectedTree < 0 {
+		m.selectedTree = 0
+	}
+	if m.selectedTree >= total {
+		m.selectedTree = total - 1
+	}
+	if m.selectedTree < m.treeScroll {
+		m.treeScroll = m.selectedTree
+	}
+	if m.selectedTree >= m.treeScroll+pageSize {
+		m.treeScroll = m.selectedTree - pageSize + 1
+	}
+	maxScroll := total - pageSize
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.treeScroll > maxScroll {
+		m.treeScroll = maxScroll
+	}
+	if m.treeScroll < 0 {
+		m.treeScroll = 0
+	}
+}
+
+func (m Model) visibleTreeWindow(visible []treeNode, pageSize int) []treeNode {
+	if pageSize < 1 {
+		pageSize = 1
+	}
+	start := clamp(m.treeScroll, 0, max(0, len(visible)-1))
+	end := start + pageSize
+	if end > len(visible) {
+		end = len(visible)
+	}
+	return visible[start:end]
+}
+
+func (m Model) mainPanelHeight() int {
+	return clamp(m.height-9, 12, 24)
+}
+
+func (m Model) addressTreePageSize(panelHeight int) int {
+	bodyLines := panelHeight - panelStyle.GetVerticalFrameSize() - 1
+	fixedLines := 2 // blank line + Search hint
+	if m.launch.Endpoint != "" {
+		fixedLines += 2
+	}
+	if !m.connected {
+		fixedLines++
+	}
+	pageSize := bodyLines - fixedLines
+	if pageSize < 1 {
+		return 1
+	}
+	return pageSize
 }
 
 func (m Model) visibleTree() []treeNode {
