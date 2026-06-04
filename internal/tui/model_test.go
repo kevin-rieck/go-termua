@@ -206,6 +206,65 @@ func TestWatchlistSubscribesSelectedVariableNode(t *testing.T) {
 	}
 }
 
+func TestSelectedVariableNodeSubscribesLiveValueIntoDetails(t *testing.T) {
+	updates := make(chan opcua.LiveValue, 1)
+	client := &fakeClient{subscriptions: map[string]chan opcua.LiveValue{"ns=2;s=Pressure": updates}}
+	model := NewModel(Dependencies{Client: client})
+	model.connected = true
+	model.addressSpace = &AddressSpace{tree: []treeNode{
+		{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}, expanded: true, childrenLoaded: true},
+		{node: opcua.AddressNode{NodeID: "ns=2;s=Pressure", DisplayName: "Pressure", NodeClass: "Variable"}, depth: 1},
+	}}
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if cmd == nil {
+		t.Fatal("expected selected-node subscribe command")
+	}
+	model = updated.(Model)
+	if !model.selectedValue.subscribing || model.selectedValue.node.NodeID != "ns=2;s=Pressure" {
+		t.Fatalf("selected value = %#v", model.selectedValue)
+	}
+
+	updated, cmd = model.Update(cmd())
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("expected wait-for-selected-value command")
+	}
+
+	updates <- opcua.LiveValue{NodeID: "ns=2;s=Pressure", Value: "12.3", Status: "StatusOK"}
+	updated, _ = model.Update(cmd())
+	view := updated.(Model).View()
+	if !strings.Contains(view, "Pressure") || !strings.Contains(view, "Value") || !strings.Contains(view, "12.3") || !strings.Contains(view, "Health") {
+		t.Fatalf("expected selected Live Value in details:\n%s", view)
+	}
+}
+
+func TestSelectingNonVariableCancelsSelectedLiveValue(t *testing.T) {
+	sub := &fakeSubscription{}
+	model := NewModel(Dependencies{Client: &fakeClient{}})
+	model.connected = true
+	model.addressSpace = &AddressSpace{tree: []treeNode{
+		{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}, expanded: true, childrenLoaded: true},
+	}}
+	model.selectedValue = selectedValueState{
+		node:         opcua.AddressNode{NodeID: "ns=2;s=Flow", DisplayName: "Flow", NodeClass: "Variable"},
+		subscription: sub,
+	}
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(Model)
+	if model.selectedValue.node.NodeID != "" {
+		t.Fatalf("expected selected Live Value cleared, got %#v", model.selectedValue)
+	}
+	if cmd == nil {
+		t.Fatal("expected cancel command")
+	}
+	cmd()
+	if !sub.cancelled {
+		t.Fatal("expected previous selected-node subscription cancelled")
+	}
+}
+
 func TestWatchlistScrollsWhenFocused(t *testing.T) {
 	model := NewModel(Dependencies{})
 	model.focus = focusWatchlist
@@ -267,12 +326,16 @@ func (f *fakeClient) BrowseChildren(ctx context.Context, nodeID string) ([]opcua
 }
 
 func (f *fakeClient) SubscribeValue(ctx context.Context, nodeID string) (<-chan opcua.LiveValue, opcua.ValueSubscription, error) {
-	return f.subscriptions[nodeID], fakeSubscription{}, nil
+	return f.subscriptions[nodeID], &fakeSubscription{}, nil
 }
 
 func (f *fakeClient) Close(ctx context.Context) error { return nil }
 
-type fakeSubscription struct{}
+type fakeSubscription struct {
+	cancelled bool
+}
 
-func (fakeSubscription) Cancel(ctx context.Context) error { return nil }
-
+func (f *fakeSubscription) Cancel(ctx context.Context) error {
+	f.cancelled = true
+	return nil
+}
