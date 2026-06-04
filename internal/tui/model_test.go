@@ -49,6 +49,50 @@ func TestEndpointDiscoveryUpdatesDetails(t *testing.T) {
 	if !strings.Contains(view, "None · None · Anonymous") {
 		t.Fatalf("expected endpoint details:\n%s", view)
 	}
+	if !strings.Contains(view, "Enter connect") {
+		t.Fatalf("expected endpoint selection footer:\n%s", view)
+	}
+}
+
+func TestEndpointSelectionMovesAndConnects(t *testing.T) {
+	client := &fakeClient{}
+	model := NewModel(Dependencies{Client: client, Launch: app.LaunchOptions{Endpoint: "opc.tcp://localhost:4840"}})
+	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{
+		{SecurityMode: "Sign", SecurityPolicy: "Basic256Sha256", UserTokenTypes: []string{"Anonymous"}},
+		{SecurityMode: "None", SecurityPolicy: "None", UserTokenTypes: []string{"Anonymous"}},
+	}})
+
+	selected := updated.(Model)
+	if selected.selectedEndpoint != 1 {
+		t.Fatalf("selected endpoint = %d", selected.selectedEndpoint)
+	}
+
+	updated, _ = selected.Update(tea.KeyMsg{Type: tea.KeyDown})
+	selected = updated.(Model)
+	if selected.selectedEndpoint != 0 {
+		t.Fatalf("selected endpoint after down = %d", selected.selectedEndpoint)
+	}
+
+	updated, cmd := selected.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	selected = updated.(Model)
+	if cmd == nil {
+		t.Fatal("expected connect command")
+	}
+	if !selected.connecting {
+		t.Fatal("expected model to be connecting")
+	}
+
+	msg := cmd()
+	connection, ok := msg.(endpointConnectionMsg)
+	if !ok {
+		t.Fatalf("expected endpointConnectionMsg, got %T", msg)
+	}
+	if connection.Err != nil {
+		t.Fatalf("connect error = %v", connection.Err)
+	}
+	if client.connected.SecurityPolicy != "Basic256Sha256" || client.connected.SecurityMode != "Sign" {
+		t.Fatalf("connected request = %#v", client.connected)
+	}
 }
 
 func TestInitDiscoversEndpointWhenProvided(t *testing.T) {
@@ -70,6 +114,7 @@ func TestInitDiscoversEndpointWhenProvided(t *testing.T) {
 type fakeClient struct {
 	discovered string
 	endpoints  []opcua.Endpoint
+	connected  opcua.ConnectRequest
 }
 
 func (f *fakeClient) DiscoverEndpoints(ctx context.Context, endpoint string) ([]opcua.Endpoint, error) {
@@ -77,5 +122,8 @@ func (f *fakeClient) DiscoverEndpoints(ctx context.Context, endpoint string) ([]
 	return f.endpoints, nil
 }
 
-func (f *fakeClient) Connect(ctx context.Context, request opcua.ConnectRequest) error { return nil }
-func (f *fakeClient) Close(ctx context.Context) error                                { return nil }
+func (f *fakeClient) Connect(ctx context.Context, request opcua.ConnectRequest) error {
+	f.connected = request
+	return nil
+}
+func (f *fakeClient) Close(ctx context.Context) error { return nil }

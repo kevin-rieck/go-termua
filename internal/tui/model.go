@@ -34,18 +34,26 @@ type endpointDiscoveryMsg struct {
 	Err       error
 }
 
+type endpointConnectionMsg struct {
+	Request opcua.ConnectRequest
+	Err     error
+}
+
 type Model struct {
 	client opcua.Client
 	paths  config.Paths
 	launch app.LaunchOptions
 
-	width      int
-	height     int
-	focus      focus
-	showHelp   bool
-	statusLine string
-	endpoints  []opcua.Endpoint
-	details    []string
+	width            int
+	height           int
+	focus            focus
+	showHelp         bool
+	statusLine       string
+	endpoints        []opcua.Endpoint
+	selectedEndpoint int
+	connecting       bool
+	connected        bool
+	details          []string
 }
 
 func NewModel(deps Dependencies) Model {
@@ -102,6 +110,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.focus = (m.focus + 1) % 3
 		case "shift+tab":
 			m.focus = (m.focus + 2) % 3
+		case "up", "k":
+			if m.hasEndpointSelection() {
+				m.moveEndpointSelection(-1)
+			}
+		case "down", "j":
+			if m.hasEndpointSelection() {
+				m.moveEndpointSelection(1)
+			}
+		case "enter":
+			if cmd := m.connectSelectedEndpoint(); cmd != nil {
+				return m, cmd
+			}
 		}
 	case endpointDiscoveryMsg:
 		if msg.Err != nil {
@@ -112,8 +132,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		log.Printf("endpoint discovery succeeded: endpoints=%d", len(msg.Endpoints))
 		m.endpoints = msg.Endpoints
+		m.selectedEndpoint = defaultEndpointSelection(msg.Endpoints)
+		m.connected = false
+		m.connecting = false
 		m.statusLine = fmt.Sprintf("Read-Only Mode · discovered %d endpoint(s)", len(msg.Endpoints))
-		m.details = endpointDetailLines(msg.Endpoints)
+		m.details = endpointDetailLines(msg.Endpoints, m.selectedEndpoint)
+	case endpointConnectionMsg:
+		m.connecting = false
+		if msg.Err != nil {
+			log.Printf("endpoint connection failed: %v", msg.Err)
+			m.connected = false
+			m.statusLine = "Read-Only Mode · connection failed"
+			m.details = append(selectedEndpointLines(m.endpoints, m.selectedEndpoint), "", "Connection failed.", msg.Err.Error())
+			return m, nil
+		}
+		log.Printf("endpoint connection succeeded: endpoint=%s securityPolicy=%s securityMode=%s authType=%s", msg.Request.Endpoint, msg.Request.SecurityPolicy, msg.Request.SecurityMode, msg.Request.AuthType)
+		m.connected = true
+		m.statusLine = fmt.Sprintf("Read-Only Mode · connected · %s · %s", compactSecurityMode(msg.Request.SecurityMode), msg.Request.SecurityPolicy)
+		m.details = append(selectedEndpointLines(m.endpoints, m.selectedEndpoint), "", "Connected with Anonymous authentication.", "Address Space browsing starts next.")
 	}
 	return m, nil
 }
@@ -151,9 +187,16 @@ func (m Model) View() string {
 }
 
 func (m Model) addressSpaceLines() []string {
+	objectsHint := "  ▸ Connect to start lazy browsing"
+	if m.connecting {
+		objectsHint = "  ▸ Connecting…"
+	}
+	if m.connected {
+		objectsHint = "  ▸ Browse loading is not implemented yet"
+	}
 	lines := []string{
 		branchStyle.Render("Objects"),
-		mutedStyle.Render("  ▸ Connect to start lazy browsing"),
+		mutedStyle.Render(objectsHint),
 		"",
 		labelStyle.Render("Search") + ": indexed Objects nodes",
 	}
@@ -175,7 +218,11 @@ func (m Model) topBar(width int) string {
 
 func (m Model) footer(width int) string {
 	left := footerStyle.Render(m.statusLine)
-	right := footerStyle.Render("Tab focus · ? help · q quit")
+	rightHint := "Tab focus · ? help · q quit"
+	if m.hasEndpointSelection() {
+		rightHint = "↑/↓ endpoint · Enter connect · ? help · q quit"
+	}
+	right := footerStyle.Render(rightHint)
 	space := width - lipgloss.Width(left) - lipgloss.Width(right)
 	if space < 1 {
 		space = 1
@@ -237,16 +284,73 @@ func discoverEndpointsCmd(client opcua.Client, endpoint string) tea.Cmd {
 	}
 }
 
-func endpointDetailLines(endpoints []opcua.Endpoint) []string {
+func connectEndpointCmd(client opcua.Client, request opcua.ConnectRequest) tea.Cmd {
+	return func() tea.Msg {
+		log.Printf("endpoint connection started: endpoint=%s securityPolicy=%s securityMode=%s authType=%s", request.Endpoint, request.SecurityPolicy, request.SecurityMode, request.AuthType)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		err := client.Connect(ctx, request)
+		return endpointConnectionMsg{Request: request, Err: err}
+	}
+}
+
+func (m *Model) moveEndpointSelection(delta int) {
+	if len(m.endpoints) == 0 {
+		return
+	}
+	m.selectedEndpoint = (m.selectedEndpoint + delta + len(m.endpoints)) % len(m.endpoints)
+	m.details = endpointDetailLines(m.endpoints, m.selectedEndpoint)
+}
+
+func (m Model) hasEndpointSelection() bool {
+	return len(m.endpoints) > 0 && !m.connecting && !m.connected
+}
+
+func (m *Model) connectSelectedEndpoint() tea.Cmd {
+	if !m.hasEndpointSelection() || m.client == nil || m.launch.Endpoint == "" {
+		return nil
+	}
+
+	endpoint := m.endpoints[m.selectedEndpoint]
+	if !supportsAuth(endpoint, opcua.AuthAnonymous) {
+		m.statusLine = "Read-Only Mode · endpoint requires credentials"
+		m.details = append(selectedEndpointLines(m.endpoints, m.selectedEndpoint), "", "This endpoint does not advertise Anonymous authentication.", "Username/password selection is not implemented yet.")
+		return nil
+	}
+
+	request := opcua.ConnectRequest{
+		Endpoint:       m.launch.Endpoint,
+		SecurityPolicy: endpoint.SecurityPolicy,
+		SecurityMode:   endpoint.SecurityMode,
+		AuthType:       opcua.AuthAnonymous,
+	}
+	m.connecting = true
+	m.statusLine = fmt.Sprintf("Read-Only Mode · connecting · %s · %s", compactSecurityMode(endpoint.SecurityMode), endpoint.SecurityPolicy)
+	m.details = append(selectedEndpointLines(m.endpoints, m.selectedEndpoint), "", "Connecting with Anonymous authentication…")
+	return connectEndpointCmd(m.client, request)
+}
+
+func endpointDetailLines(endpoints []opcua.Endpoint, selected int) []string {
 	if len(endpoints) == 0 {
 		return []string{"No endpoints discovered."}
 	}
 
-	lines := []string{fmt.Sprintf("Discovered endpoints: %d", len(endpoints)), ""}
+	lines := []string{fmt.Sprintf("Discovered endpoints: %d", len(endpoints)), mutedStyle.Render("Select an endpoint and press Enter to connect."), ""}
+	lines = append(lines, selectedEndpointLines(endpoints, selected)...)
+	return lines
+}
+
+func selectedEndpointLines(endpoints []opcua.Endpoint, selected int) []string {
+	lines := []string{}
 	for i, endpoint := range endpoints {
-		if i >= 4 {
+		if i >= 6 {
 			lines = append(lines, mutedStyle.Render(fmt.Sprintf("… %d more", len(endpoints)-i)))
 			break
+		}
+		marker := " "
+		if i == selected {
+			marker = "›"
 		}
 		tokens := compactTokens(endpoint.UserTokenTypes)
 		if tokens == "" {
@@ -254,17 +358,43 @@ func endpointDetailLines(endpoints []opcua.Endpoint) []string {
 		}
 		security := fmt.Sprintf("%s · %s", compactSecurityMode(endpoint.SecurityMode), endpoint.SecurityPolicy)
 		lines = append(lines,
-			fmt.Sprintf("%d. %s · %s", i+1, security, tokens),
+			fmt.Sprintf("%s %d. %s · %s", marker, i+1, security, tokens),
 			"   "+labelStyle.Render("Auth")+": "+tokens,
 		)
 		if endpoint.SecurityLevel > 0 {
 			lines = append(lines, "   "+labelStyle.Render("Level")+fmt.Sprintf(": %d", endpoint.SecurityLevel))
+		}
+		if endpoint.ServerThumbprint != "" {
+			lines = append(lines, "   "+labelStyle.Render("Server cert")+": "+endpoint.ServerThumbprint)
 		}
 		if i != len(endpoints)-1 {
 			lines = append(lines, "")
 		}
 	}
 	return lines
+}
+
+func defaultEndpointSelection(endpoints []opcua.Endpoint) int {
+	for i, endpoint := range endpoints {
+		if compactSecurityMode(endpoint.SecurityMode) == "None" && endpoint.SecurityPolicy == "None" && supportsAuth(endpoint, opcua.AuthAnonymous) {
+			return i
+		}
+	}
+	for i, endpoint := range endpoints {
+		if supportsAuth(endpoint, opcua.AuthAnonymous) {
+			return i
+		}
+	}
+	return 0
+}
+
+func supportsAuth(endpoint opcua.Endpoint, auth opcua.AuthType) bool {
+	for _, token := range endpoint.UserTokenTypes {
+		if strings.EqualFold(strings.TrimPrefix(strings.TrimSpace(token), "UserTokenType"), string(auth)) {
+			return true
+		}
+	}
+	return false
 }
 
 func compactSecurityMode(mode string) string {
