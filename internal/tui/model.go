@@ -39,6 +39,21 @@ type endpointConnectionMsg struct {
 	Err     error
 }
 
+type browseChildrenMsg struct {
+	ParentNodeID string
+	Children     []opcua.AddressNode
+	Err          error
+}
+
+type treeNode struct {
+	node           opcua.AddressNode
+	depth          int
+	expanded       bool
+	childrenLoaded bool
+	loading        bool
+	err            error
+}
+
 type Model struct {
 	client opcua.Client
 	paths  config.Paths
@@ -54,6 +69,8 @@ type Model struct {
 	connecting       bool
 	connected        bool
 	details          []string
+	tree             []treeNode
+	selectedTree     int
 }
 
 func NewModel(deps Dependencies) Model {
@@ -83,6 +100,9 @@ func NewModel(deps Dependencies) Model {
 		focus:      focusTree,
 		statusLine: status,
 		details:    details,
+		tree: []treeNode{{
+			node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", BrowseName: "Objects", NodeClass: "Object"},
+		}},
 	}
 }
 
@@ -113,15 +133,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "up", "k":
 			if m.hasEndpointSelection() {
 				m.moveEndpointSelection(-1)
+			} else if m.focus == focusTree {
+				m.moveTreeSelection(-1)
 			}
 		case "down", "j":
 			if m.hasEndpointSelection() {
 				m.moveEndpointSelection(1)
+			} else if m.focus == focusTree {
+				m.moveTreeSelection(1)
 			}
-		case "enter":
+		case "enter", "right", "l":
 			if cmd := m.connectSelectedEndpoint(); cmd != nil {
 				return m, cmd
 			}
+			if cmd := m.expandSelectedNode(); cmd != nil {
+				return m, cmd
+			}
+		case "left", "h":
+			m.collapseSelectedNode()
 		}
 	case endpointDiscoveryMsg:
 		if msg.Err != nil {
@@ -149,7 +178,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		log.Printf("endpoint connection succeeded: endpoint=%s securityPolicy=%s securityMode=%s authType=%s", msg.Request.Endpoint, msg.Request.SecurityPolicy, msg.Request.SecurityMode, msg.Request.AuthType)
 		m.connected = true
 		m.statusLine = fmt.Sprintf("Read-Only Mode · connected · %s · %s", compactSecurityMode(msg.Request.SecurityMode), msg.Request.SecurityPolicy)
-		m.details = append(selectedEndpointLines(m.endpoints, m.selectedEndpoint), "", "Connected with Anonymous authentication.", "Address Space browsing starts next.")
+		m.details = append(selectedEndpointLines(m.endpoints, m.selectedEndpoint), "", "Connected with Anonymous authentication.", "Loading Objects Address Space…")
+		return m, m.startBrowse("i=85")
+	case browseChildrenMsg:
+		m.applyBrowseResult(msg)
 	}
 	return m, nil
 }
@@ -187,19 +219,38 @@ func (m Model) View() string {
 }
 
 func (m Model) addressSpaceLines() []string {
-	objectsHint := "  ▸ Connect to start lazy browsing"
-	if m.connecting {
-		objectsHint = "  ▸ Connecting…"
+	lines := make([]string, 0, len(m.tree)+4)
+	visible := m.visibleTree()
+	for i, node := range visible {
+		indent := strings.Repeat("  ", node.depth)
+		marker := " "
+		if i == m.selectedTree && m.focus == focusTree {
+			marker = "›"
+		}
+		expander := " "
+		if node.loading {
+			expander = "…"
+		} else if !node.childrenLoaded {
+			expander = "▸"
+		} else if node.expanded {
+			expander = "▾"
+		} else {
+			expander = "▸"
+		}
+		name := node.node.DisplayName
+		if node.node.NodeClass == "Variable" {
+			name = name + " " + mutedStyle.Render("variable")
+		}
+		line := fmt.Sprintf("%s %s%s%s", marker, indent, expander, name)
+		if node.err != nil {
+			line += " " + mutedStyle.Render("browse failed")
+		}
+		lines = append(lines, line)
 	}
-	if m.connected {
-		objectsHint = "  ▸ Browse loading is not implemented yet"
+	if !m.connected {
+		lines = append(lines, mutedStyle.Render("  Connect to start lazy browsing"))
 	}
-	lines := []string{
-		branchStyle.Render("Objects"),
-		mutedStyle.Render(objectsHint),
-		"",
-		labelStyle.Render("Search") + ": indexed Objects nodes",
-	}
+	lines = append(lines, "", labelStyle.Render("Search")+": indexed Objects nodes")
 	if m.launch.Endpoint != "" {
 		lines = append(lines, "", labelStyle.Render("Endpoint")+": "+m.launch.Endpoint)
 	}
@@ -221,6 +272,8 @@ func (m Model) footer(width int) string {
 	rightHint := "Tab focus · ? help · q quit"
 	if m.hasEndpointSelection() {
 		rightHint = "↑/↓ endpoint · Enter connect · ? help · q quit"
+	} else if m.focus == focusTree && m.connected {
+		rightHint = "↑/↓ node · Enter expand · ← collapse · ? help · q quit"
 	}
 	right := footerStyle.Render(rightHint)
 	space := width - lipgloss.Width(left) - lipgloss.Width(right)
@@ -260,7 +313,7 @@ func (m Model) helpView() string {
 		helpPanelStyle.Render(lipgloss.JoinVertical(lipgloss.Left,
 			panelTitleStyle.Render("Help"),
 			"↑/↓ or j/k  Move selection",
-			"Enter       Expand/select",
+			"Enter       Connect/expand Address Space node",
 			"/           Search indexed Objects nodes",
 			"w           Add Variable Node to Watchlist",
 			"s           Export Snapshot",
@@ -293,6 +346,167 @@ func connectEndpointCmd(client opcua.Client, request opcua.ConnectRequest) tea.C
 		err := client.Connect(ctx, request)
 		return endpointConnectionMsg{Request: request, Err: err}
 	}
+}
+
+func browseChildrenCmd(client opcua.Client, parentNodeID string) tea.Cmd {
+	return func() tea.Msg {
+		log.Printf("address space browse started: parentNodeID=%s", parentNodeID)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		children, err := client.BrowseChildren(ctx, parentNodeID)
+		return browseChildrenMsg{ParentNodeID: parentNodeID, Children: children, Err: err}
+	}
+}
+
+func (m *Model) moveTreeSelection(delta int) {
+	visible := m.visibleTree()
+	if len(visible) == 0 {
+		return
+	}
+	m.selectedTree = (m.selectedTree + delta + len(visible)) % len(visible)
+	m.details = nodeDetailLines(visible[m.selectedTree].node)
+}
+
+func (m *Model) expandSelectedNode() tea.Cmd {
+	if !m.connected || m.client == nil || len(m.tree) == 0 {
+		return nil
+	}
+	idx := m.selectedTreeIndex()
+	if idx < 0 {
+		return nil
+	}
+	if m.tree[idx].loading {
+		return nil
+	}
+	if m.tree[idx].childrenLoaded {
+		m.tree[idx].expanded = true
+		return nil
+	}
+	return m.startBrowse(m.tree[idx].node.NodeID)
+}
+
+func (m *Model) startBrowse(nodeID string) tea.Cmd {
+	idx := m.treeIndexByNodeID(nodeID)
+	if idx < 0 {
+		return nil
+	}
+	m.tree[idx].loading = true
+	m.tree[idx].err = nil
+	m.statusLine = "Read-Only Mode · browsing Address Space"
+	return browseChildrenCmd(m.client, nodeID)
+}
+
+func (m *Model) collapseSelectedNode() {
+	idx := m.selectedTreeIndex()
+	if idx < 0 || !m.tree[idx].childrenLoaded {
+		return
+	}
+	m.tree[idx].expanded = false
+}
+
+func (m *Model) applyBrowseResult(msg browseChildrenMsg) {
+	idx := m.treeIndexByNodeID(msg.ParentNodeID)
+	if idx < 0 {
+		return
+	}
+	m.tree[idx].loading = false
+	if msg.Err != nil {
+		log.Printf("address space browse failed: parentNodeID=%s error=%v", msg.ParentNodeID, msg.Err)
+		m.tree[idx].err = msg.Err
+		m.statusLine = "Read-Only Mode · browse failed"
+		m.details = append(nodeDetailLines(m.tree[idx].node), "", "Browse failed.", msg.Err.Error())
+		return
+	}
+
+	children := make([]treeNode, 0, len(msg.Children))
+	for _, child := range msg.Children {
+		if child.NodeID == "" {
+			continue
+		}
+		children = append(children, treeNode{node: child, depth: m.tree[idx].depth + 1})
+	}
+	m.tree[idx].childrenLoaded = true
+	m.tree[idx].expanded = true
+	m.tree = insertTreeChildren(m.tree, idx, children)
+	m.statusLine = fmt.Sprintf("Read-Only Mode · browsed %d child node(s)", len(children))
+	m.details = append(nodeDetailLines(m.tree[idx].node), "", fmt.Sprintf("Children loaded: %d", len(children)))
+}
+
+func (m Model) visibleTree() []treeNode {
+	visible := make([]treeNode, 0, len(m.tree))
+	hiddenBelowDepth := -1
+	for _, node := range m.tree {
+		if hiddenBelowDepth >= 0 {
+			if node.depth > hiddenBelowDepth {
+				continue
+			}
+			hiddenBelowDepth = -1
+		}
+		visible = append(visible, node)
+		if !node.expanded {
+			hiddenBelowDepth = node.depth
+		}
+	}
+	return visible
+}
+
+func (m Model) selectedTreeIndex() int {
+	visibleIndex := 0
+	hiddenBelowDepth := -1
+	for i, node := range m.tree {
+		if hiddenBelowDepth >= 0 {
+			if node.depth > hiddenBelowDepth {
+				continue
+			}
+			hiddenBelowDepth = -1
+		}
+		if visibleIndex == m.selectedTree {
+			return i
+		}
+		visibleIndex++
+		if !node.expanded {
+			hiddenBelowDepth = node.depth
+		}
+	}
+	return -1
+}
+
+func (m Model) treeIndexByNodeID(nodeID string) int {
+	for i, node := range m.tree {
+		if node.node.NodeID == nodeID {
+			return i
+		}
+	}
+	return -1
+}
+
+func insertTreeChildren(tree []treeNode, parentIndex int, children []treeNode) []treeNode {
+	parentDepth := tree[parentIndex].depth
+	end := parentIndex + 1
+	for end < len(tree) && tree[end].depth > parentDepth {
+		end++
+	}
+	result := make([]treeNode, 0, len(tree)-(end-parentIndex-1)+len(children))
+	result = append(result, tree[:parentIndex+1]...)
+	result = append(result, children...)
+	result = append(result, tree[end:]...)
+	return result
+}
+
+func nodeDetailLines(node opcua.AddressNode) []string {
+	lines := []string{
+		labelStyle.Render("DisplayName") + ": " + node.DisplayName,
+		labelStyle.Render("NodeId") + ": " + node.NodeID,
+		labelStyle.Render("NodeClass") + ": " + node.NodeClass,
+	}
+	if node.BrowseName != "" && node.BrowseName != node.DisplayName {
+		lines = append(lines, labelStyle.Render("BrowseName")+": "+node.BrowseName)
+	}
+	if node.NodeClass == "Variable" {
+		lines = append(lines, "", "Live Value loading is next: value, health, timestamps, data type, and Engineering Unit.")
+	}
+	return lines
 }
 
 func (m *Model) moveEndpointSelection(delta int) {

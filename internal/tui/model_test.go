@@ -95,6 +95,56 @@ func TestEndpointSelectionMovesAndConnects(t *testing.T) {
 	}
 }
 
+func TestConnectedEndpointBrowsesObjectsRoot(t *testing.T) {
+	client := &fakeClient{children: map[string][]opcua.AddressNode{
+		"i=85": {{NodeID: "i=2253", DisplayName: "Server", BrowseName: "Server", NodeClass: "Object"}},
+	}}
+	model := NewModel(Dependencies{Client: client})
+
+	updated, cmd := model.Update(endpointConnectionMsg{Request: opcua.ConnectRequest{SecurityMode: "None", SecurityPolicy: "None"}})
+	if cmd == nil {
+		t.Fatal("expected browse command")
+	}
+	msg := cmd()
+	browse, ok := msg.(browseChildrenMsg)
+	if !ok {
+		t.Fatalf("expected browseChildrenMsg, got %T", msg)
+	}
+	if browse.ParentNodeID != "i=85" {
+		t.Fatalf("browsed node = %q", browse.ParentNodeID)
+	}
+
+	updated, _ = updated.(Model).Update(browse)
+	view := updated.(Model).View()
+	if !strings.Contains(view, "Server") {
+		t.Fatalf("expected browsed child in view:\n%s", view)
+	}
+}
+
+func TestExpandSelectedNodeBrowsesLazily(t *testing.T) {
+	client := &fakeClient{children: map[string][]opcua.AddressNode{
+		"i=2253": {{NodeID: "i=2258", DisplayName: "ServerStatus", BrowseName: "ServerStatus", NodeClass: "Variable"}},
+	}}
+	model := NewModel(Dependencies{Client: client})
+	model.connected = true
+	model.tree = []treeNode{
+		{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}, expanded: true, childrenLoaded: true},
+		{node: opcua.AddressNode{NodeID: "i=2253", DisplayName: "Server", NodeClass: "Object"}, depth: 1},
+	}
+	model.selectedTree = 1
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("expected lazy browse command")
+	}
+	msg := cmd().(browseChildrenMsg)
+	updated, _ = updated.(Model).Update(msg)
+	view := updated.(Model).View()
+	if !strings.Contains(view, "ServerStatus") || !strings.Contains(view, "variable") {
+		t.Fatalf("expected variable child in view:\n%s", view)
+	}
+}
+
 func TestInitDiscoversEndpointWhenProvided(t *testing.T) {
 	client := &fakeClient{endpoints: []opcua.Endpoint{{SecurityMode: "None", SecurityPolicy: "None"}}}
 	model := NewModel(Dependencies{Client: client, Launch: app.LaunchOptions{Endpoint: "opc.tcp://localhost:4840"}})
@@ -115,6 +165,7 @@ type fakeClient struct {
 	discovered string
 	endpoints  []opcua.Endpoint
 	connected  opcua.ConnectRequest
+	children   map[string][]opcua.AddressNode
 }
 
 func (f *fakeClient) DiscoverEndpoints(ctx context.Context, endpoint string) ([]opcua.Endpoint, error) {
@@ -126,4 +177,9 @@ func (f *fakeClient) Connect(ctx context.Context, request opcua.ConnectRequest) 
 	f.connected = request
 	return nil
 }
+
+func (f *fakeClient) BrowseChildren(ctx context.Context, nodeID string) ([]opcua.AddressNode, error) {
+	return f.children[nodeID], nil
+}
+
 func (f *fakeClient) Close(ctx context.Context) error { return nil }

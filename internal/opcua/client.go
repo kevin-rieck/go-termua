@@ -4,10 +4,13 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"fmt"
 	"log"
+	"sort"
 	"strings"
 
 	gopcua "github.com/gopcua/opcua"
+	"github.com/gopcua/opcua/id"
 	"github.com/gopcua/opcua/ua"
 )
 
@@ -16,6 +19,7 @@ import (
 type Client interface {
 	DiscoverEndpoints(ctx context.Context, endpoint string) ([]Endpoint, error)
 	Connect(ctx context.Context, request ConnectRequest) error
+	BrowseChildren(ctx context.Context, nodeID string) ([]AddressNode, error)
 	Close(ctx context.Context) error
 }
 
@@ -34,9 +38,17 @@ type ConnectRequest struct {
 	ConnectionName string
 	SecurityPolicy string
 	SecurityMode   string
-	AuthType        AuthType
-	Username        string
-	Password        string
+	AuthType       AuthType
+	Username       string
+	Password       string
+}
+
+// AddressNode is the app-level projection of a browsed Address Space node.
+type AddressNode struct {
+	NodeID      string
+	DisplayName string
+	BrowseName  string
+	NodeClass   string
 }
 
 type AuthType string
@@ -121,6 +133,33 @@ func (c *gopcuaClient) Connect(ctx context.Context, request ConnectRequest) erro
 	return nil
 }
 
+func (c *gopcuaClient) BrowseChildren(ctx context.Context, nodeID string) ([]AddressNode, error) {
+	if c.client == nil {
+		return nil, ua.StatusBadServerNotConnected
+	}
+	idToBrowse, err := ua.ParseNodeID(nodeID)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("opcua: BrowseChildren request nodeID=%s", nodeID)
+	refs, err := c.client.Node(idToBrowse).References(ctx, id.HierarchicalReferences, ua.BrowseDirectionForward, ua.NodeClassAll, true)
+	if err != nil {
+		log.Printf("opcua: BrowseChildren failed nodeID=%s error=%v", nodeID, err)
+		return nil, err
+	}
+
+	nodes := make([]AddressNode, 0, len(refs))
+	for _, ref := range refs {
+		nodes = append(nodes, addressNodeFromReference(ref))
+	}
+	sort.SliceStable(nodes, func(i, j int) bool {
+		return strings.ToLower(nodes[i].DisplayName) < strings.ToLower(nodes[j].DisplayName)
+	})
+	log.Printf("opcua: BrowseChildren response nodeID=%s count=%d", nodeID, len(nodes))
+	return nodes, nil
+}
+
 func (c *gopcuaClient) Close(ctx context.Context) error {
 	if c.client == nil {
 		return nil
@@ -128,6 +167,33 @@ func (c *gopcuaClient) Close(ctx context.Context) error {
 	err := c.client.Close(ctx)
 	c.client = nil
 	return err
+}
+
+func addressNodeFromReference(ref *ua.ReferenceDescription) AddressNode {
+	nodeID := ""
+	if ref.NodeID != nil {
+		nodeID = ua.NewNodeIDFromExpandedNodeID(ref.NodeID).String()
+	}
+
+	displayName := "(unnamed)"
+	if ref.DisplayName != nil && ref.DisplayName.Text != "" {
+		displayName = ref.DisplayName.Text
+	}
+
+	browseName := ""
+	if ref.BrowseName != nil {
+		browseName = ref.BrowseName.Name
+		if ref.BrowseName.NamespaceIndex != 0 {
+			browseName = fmt.Sprintf("%d:%s", ref.BrowseName.NamespaceIndex, ref.BrowseName.Name)
+		}
+	}
+
+	return AddressNode{
+		NodeID:      nodeID,
+		DisplayName: displayName,
+		BrowseName:  browseName,
+		NodeClass:   ref.NodeClass.String(),
+	}
 }
 
 func endpointFromDescription(ep *ua.EndpointDescription) Endpoint {
