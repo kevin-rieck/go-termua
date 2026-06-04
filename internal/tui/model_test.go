@@ -203,18 +203,26 @@ func TestWatchlistSubscribesSelectedVariableNode(t *testing.T) {
 		t.Fatal("expected subscribe command")
 	}
 	model = updated.(Model)
-	if len(model.watchlist) != 1 || !model.watchlist[0].subscribing {
-		t.Fatalf("watchlist = %#v", model.watchlist)
+	watched := model.inspections.Watched()
+	if len(watched) != 1 || !watched[0].Subscribing {
+		t.Fatalf("watchlist = %#v", watched)
 	}
 
-	updated, cmd = model.Update(cmd())
-	model = updated.(Model)
-	if cmd == nil {
+	var waitCmd tea.Cmd
+	for _, msg := range runCmds(cmd) {
+		var nextCmd tea.Cmd
+		updated, nextCmd = model.Update(msg)
+		model = updated.(Model)
+		if nextCmd != nil {
+			waitCmd = nextCmd
+		}
+	}
+	if waitCmd == nil {
 		t.Fatal("expected wait-for-value command")
 	}
 
 	updates <- opcua.LiveValue{NodeID: "ns=2;s=Temperature", Value: "42.5", Status: "OK"}
-	updated, _ = model.Update(cmd())
+	updated, _ = model.Update(waitCmd())
 	view := updated.(Model).View()
 	if !strings.Contains(view, "Temperature") || !strings.Contains(view, "42.5 · OK") {
 		t.Fatalf("expected subscribed Live Value in watchlist:\n%s", view)
@@ -236,8 +244,9 @@ func TestSelectedVariableNodeSubscribesLiveValueIntoDetails(t *testing.T) {
 		t.Fatal("expected selected-node subscribe command")
 	}
 	model = updated.(Model)
-	if !model.selectedValue.subscribing || model.selectedValue.node.NodeID != "ns=2;s=Pressure" {
-		t.Fatalf("selected value = %#v", model.selectedValue)
+	selected, ok := model.inspections.Selected()
+	if !ok || !selected.Subscribing || selected.Node.NodeID != "ns=2;s=Pressure" {
+		t.Fatalf("selected value = %#v, ok=%t", selected, ok)
 	}
 
 	var waitCmd tea.Cmd
@@ -311,15 +320,13 @@ func TestSelectingNonVariableCancelsSelectedLiveValue(t *testing.T) {
 	model.addressSpace = &AddressSpace{tree: []treeNode{
 		{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}, expanded: true, childrenLoaded: true},
 	}}
-	model.selectedValue = selectedValueState{
-		node:         opcua.AddressNode{NodeID: "ns=2;s=Flow", DisplayName: "Flow", NodeClass: "Variable"},
-		subscription: sub,
-	}
+	model.inspections.Select(opcua.AddressNode{NodeID: "ns=2;s=Flow", DisplayName: "Flow", NodeClass: "Variable"})
+	model.inspections.ApplySubscription("ns=2;s=Flow", make(chan opcua.LiveValue), sub, nil)
 
 	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyDown})
 	model = updated.(Model)
-	if model.selectedValue.node.NodeID != "" {
-		t.Fatalf("expected selected Live Value cleared, got %#v", model.selectedValue)
+	if selected, ok := model.inspections.Selected(); ok || selected.Node.NodeID != "" {
+		t.Fatalf("expected selected Live Value cleared, got %#v", selected)
 	}
 	if cmd == nil {
 		t.Fatal("expected cancel command")
@@ -334,7 +341,7 @@ func TestWatchlistScrollsWhenFocused(t *testing.T) {
 	model := NewModel(Dependencies{})
 	model.focus = focusWatchlist
 	for i := 0; i < 5; i++ {
-		model.watchlist = append(model.watchlist, watchItem{node: opcua.AddressNode{NodeID: fmt.Sprintf("ns=2;s=Node%d", i), DisplayName: fmt.Sprintf("Node%d", i), NodeClass: "Variable"}})
+		model.inspections.Watch(opcua.AddressNode{NodeID: fmt.Sprintf("ns=2;s=Node%d", i), DisplayName: fmt.Sprintf("Node%d", i), NodeClass: "Variable"})
 	}
 
 	updated := tea.Model(model)

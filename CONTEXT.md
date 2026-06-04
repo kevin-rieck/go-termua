@@ -40,6 +40,10 @@ _Avoid_: Tag, point, field
 The current value of a Variable Node together with its health and timestamp information.
 _Avoid_: Reading, datapoint, sample
 
+**Variable Node Inspection**:
+The focused view of one Variable Node during a Troubleshooting Session, combining its Live Value, metadata, health, Stale Value state, and Out-of-Range status.
+_Avoid_: selected value panel, node details workflow
+
 **Engineering Unit**:
 The physical unit associated with a Variable Node's Live Value, when exposed by the OPC UA Server.
 _Avoid_: Unit, label, suffix

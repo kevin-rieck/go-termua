@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +13,7 @@ import (
 	"termua/internal/app"
 	"termua/internal/config"
 	"termua/internal/opcua"
+	"termua/internal/session"
 )
 
 type Dependencies struct {
@@ -46,19 +46,6 @@ type browseChildrenMsg struct {
 	Err          error
 }
 
-type watchSubscribedMsg struct {
-	NodeID       string
-	Updates      <-chan opcua.LiveValue
-	Subscription opcua.ValueSubscription
-	Err          error
-}
-
-type watchValueMsg struct {
-	NodeID string
-	Value  opcua.LiveValue
-	Err    error
-}
-
 type selectedValueSubscribedMsg struct {
 	NodeID       string
 	Updates      <-chan opcua.LiveValue
@@ -76,29 +63,6 @@ type selectedNodeDetailsMsg struct {
 	NodeID  string
 	Details opcua.NodeDetails
 	Err     error
-}
-
-type watchItem struct {
-	node         opcua.AddressNode
-	updates      <-chan opcua.LiveValue
-	subscription opcua.ValueSubscription
-	value        opcua.LiveValue
-	subscribing  bool
-	err          error
-	updateCount  int
-}
-
-type selectedValueState struct {
-	node           opcua.AddressNode
-	updates        <-chan opcua.LiveValue
-	subscription   opcua.ValueSubscription
-	value          opcua.LiveValue
-	details        opcua.NodeDetails
-	subscribing    bool
-	loadingDetails bool
-	err            error
-	detailsErr     error
-	stale          bool
 }
 
 type Model struct {
@@ -119,10 +83,9 @@ type Model struct {
 	addressSpace     *AddressSpace
 	selectedTree     int
 	treeScroll       int
-	watchlist        []watchItem
+	inspections      *session.InspectionSet
 	selectedWatch    int
 	watchScroll      int
-	selectedValue    selectedValueState
 }
 
 func NewModel(deps Dependencies) Model {
@@ -153,6 +116,7 @@ func NewModel(deps Dependencies) Model {
 		statusLine:   status,
 		details:      details,
 		addressSpace: NewAddressSpace(),
+		inspections:  session.NewInspectionSet(),
 	}
 }
 
@@ -244,10 +208,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.startBrowse("i=85")
 	case browseChildrenMsg:
 		m.applyBrowseResult(msg)
-	case watchSubscribedMsg:
-		return m.applyWatchSubscribed(msg)
-	case watchValueMsg:
-		return m.applyWatchValue(msg)
 	case selectedValueSubscribedMsg:
 		return m.applySelectedValueSubscribed(msg)
 	case selectedValueMsg:
@@ -288,46 +248,50 @@ func (m Model) View() string {
 }
 
 func (m Model) watchlistLines(panelHeight int) []string {
-	if len(m.watchlist) == 0 {
+	watched := m.inspections.Watched()
+	if len(watched) == 0 {
 		return []string{"No Variable Nodes added yet.", "Select a Variable Node and press w to subscribe its Live Value."}
 	}
 
 	pageSize := m.watchlistPageSize(panelHeight)
-	start := clamp(m.watchScroll, 0, max(0, len(m.watchlist)-1))
+	start := clamp(m.watchScroll, 0, max(0, len(watched)-1))
 	end := start + pageSize
-	if end > len(m.watchlist) {
-		end = len(m.watchlist)
+	if end > len(watched) {
+		end = len(watched)
 	}
 
 	lines := make([]string, 0, pageSize*2+1)
 	if start > 0 {
 		lines = append(lines, mutedStyle.Render(fmt.Sprintf("↑ %d earlier", start)))
 	}
-	for i, item := range m.watchlist[start:end] {
+	for i, item := range watched[start:end] {
 		watchIndex := start + i
 		state := "subscribing…"
-		if item.err != nil {
-			state = "subscription failed: " + item.err.Error()
-		} else if item.value.Value != "" {
-			stamp := compactTimestamp(item.value.SourceTimestamp)
-			if stamp == "" {
-				stamp = compactTimestamp(item.value.ServerTimestamp)
+		if item.Err != nil {
+			state = "subscription failed: " + item.Err.Error()
+			if item.Stale {
+				state = "Stale Value: " + item.Err.Error()
 			}
-			state = fmt.Sprintf("%s · %s", ellipsize(item.value.Value, 48), compactStatus(item.value.Status))
+		} else if item.Value.Value != "" {
+			stamp := compactTimestamp(item.Value.SourceTimestamp)
+			if stamp == "" {
+				stamp = compactTimestamp(item.Value.ServerTimestamp)
+			}
+			state = fmt.Sprintf("%s · %s", ellipsize(item.Value.Value, 48), compactStatus(item.Value.Status))
 			if stamp != "" {
 				state += " · " + stamp
 			}
-		} else if !item.subscribing {
+		} else if !item.Subscribing {
 			state = "waiting for first Live Value…"
 		}
 		marker := "•"
 		if m.focus == focusWatchlist && watchIndex == m.selectedWatch {
 			marker = "›"
 		}
-		lines = append(lines, fmt.Sprintf("%s %s = %s", marker, item.node.DisplayName, state), "  "+mutedStyle.Render(ellipsize(item.node.NodeID, 72)))
+		lines = append(lines, fmt.Sprintf("%s %s = %s", marker, item.Node.DisplayName, state), "  "+mutedStyle.Render(ellipsize(item.Node.NodeID, 72)))
 	}
-	if end < len(m.watchlist) {
-		lines = append(lines, mutedStyle.Render(fmt.Sprintf("↓ %d more", len(m.watchlist)-end)))
+	if end < len(watched) {
+		lines = append(lines, mutedStyle.Render(fmt.Sprintf("↓ %d more", len(watched)-end)))
 	}
 	return lines
 }
@@ -508,27 +472,6 @@ func browseChildrenCmd(client opcua.Client, parentNodeID string) tea.Cmd {
 	}
 }
 
-func subscribeValueCmd(client opcua.Client, nodeID string) tea.Cmd {
-	return func() tea.Msg {
-		log.Printf("watchlist subscription started: nodeID=%s", nodeID)
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		updates, subscription, err := client.SubscribeValue(ctx, nodeID)
-		return watchSubscribedMsg{NodeID: nodeID, Updates: updates, Subscription: subscription, Err: err}
-	}
-}
-
-func waitForWatchValueCmd(nodeID string, updates <-chan opcua.LiveValue) tea.Cmd {
-	return func() tea.Msg {
-		value, ok := <-updates
-		if !ok {
-			return watchValueMsg{NodeID: nodeID, Err: fmt.Errorf("subscription closed")}
-		}
-		return watchValueMsg{NodeID: nodeID, Value: value}
-	}
-}
-
 func subscribeSelectedValueCmd(client opcua.Client, nodeID string) tea.Cmd {
 	return func() tea.Msg {
 		log.Printf("selected-node subscription started: nodeID=%s", nodeID)
@@ -572,6 +515,33 @@ func cancelSubscriptionCmd(subscription opcua.ValueSubscription) tea.Cmd {
 	}
 }
 
+func (m Model) commandsFromRequests(requests []session.Request) tea.Cmd {
+	if len(requests) == 0 {
+		return nil
+	}
+	cmds := make([]tea.Cmd, 0, len(requests))
+	for _, request := range requests {
+		switch request.Kind {
+		case session.RequestSubscribeValue:
+			if m.client != nil {
+				cmds = append(cmds, subscribeSelectedValueCmd(m.client, request.NodeID))
+			}
+		case session.RequestReadDetails:
+			if m.client != nil {
+				cmds = append(cmds, readSelectedNodeDetailsCmd(m.client, request.NodeID))
+			}
+		case session.RequestWaitValue:
+			cmds = append(cmds, waitForSelectedValueCmd(request.NodeID, request.Updates))
+		case session.RequestCancelSubscription:
+			cmds = append(cmds, cancelSubscriptionCmd(request.Subscription))
+		}
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
+}
+
 func (m *Model) moveTreeSelection(delta int) tea.Cmd {
 	visible := m.addressSpace.View()
 	if len(visible) == 0 {
@@ -583,12 +553,13 @@ func (m *Model) moveTreeSelection(delta int) tea.Cmd {
 }
 
 func (m *Model) moveWatchSelection(delta int) {
-	if len(m.watchlist) == 0 {
+	watched := m.inspections.Watched()
+	if len(watched) == 0 {
 		m.selectedWatch = 0
 		m.watchScroll = 0
 		return
 	}
-	m.selectedWatch = (m.selectedWatch + delta + len(m.watchlist)) % len(m.watchlist)
+	m.selectedWatch = (m.selectedWatch + delta + len(watched)) % len(watched)
 	m.ensureSelectedWatchVisible(m.watchlistPageSize(m.watchPanelHeight(m.mainPanelHeight())))
 }
 
@@ -635,151 +606,63 @@ func (m *Model) addSelectedNodeToWatchlist() tea.Cmd {
 		m.statusLine = "Read-Only Mode · select a Variable Node to watch"
 		return nil
 	}
-	if m.watchIndexByNodeID(node.NodeID) >= 0 {
+	if m.inspections.IsWatched(node.NodeID) {
 		m.statusLine = "Read-Only Mode · Variable Node already on Watchlist"
 		return nil
 	}
-	m.watchlist = append(m.watchlist, watchItem{node: node, subscribing: true})
-	m.selectedWatch = len(m.watchlist) - 1
+	requests := m.inspections.Watch(node)
+	m.selectedWatch = len(m.inspections.Watched()) - 1
 	m.ensureSelectedWatchVisible(m.watchlistPageSize(m.watchPanelHeight(m.mainPanelHeight())))
 	m.statusLine = "Read-Only Mode · subscribing Watchlist node"
-	return subscribeValueCmd(m.client, node.NodeID)
-}
-
-func (m Model) applyWatchSubscribed(msg watchSubscribedMsg) (tea.Model, tea.Cmd) {
-	idx := m.watchIndexByNodeID(msg.NodeID)
-	if idx < 0 {
-		return m, nil
-	}
-	m.watchlist[idx].subscribing = false
-	if msg.Err != nil {
-		log.Printf("watchlist subscription failed: nodeID=%s error=%v", msg.NodeID, msg.Err)
-		m.watchlist[idx].err = msg.Err
-		m.statusLine = "Read-Only Mode · Watchlist subscription failed"
-		return m, nil
-	}
-	m.watchlist[idx].updates = msg.Updates
-	m.watchlist[idx].subscription = msg.Subscription
-	m.statusLine = "Read-Only Mode · Watchlist subscription active"
-	return m, waitForWatchValueCmd(msg.NodeID, msg.Updates)
-}
-
-func (m Model) applyWatchValue(msg watchValueMsg) (tea.Model, tea.Cmd) {
-	idx := m.watchIndexByNodeID(msg.NodeID)
-	if idx < 0 {
-		return m, nil
-	}
-	if msg.Err != nil {
-		m.watchlist[idx].err = msg.Err
-		m.statusLine = "Read-Only Mode · Watchlist subscription closed"
-		return m, nil
-	}
-	m.watchlist[idx].value = msg.Value
-	m.watchlist[idx].err = nil
-	m.watchlist[idx].updateCount++
-	m.statusLine = fmt.Sprintf("Read-Only Mode · Watchlist updated · %s", m.watchlist[idx].node.DisplayName)
-	return m, waitForWatchValueCmd(msg.NodeID, m.watchlist[idx].updates)
+	return m.commandsFromRequests(requests)
 }
 
 func (m *Model) selectNode(node opcua.AddressNode) tea.Cmd {
 	if node.NodeClass != "Variable" || !m.connected || m.client == nil {
 		m.details = nodeDetailLines(node)
-		return m.cancelSelectedValue()
+		return m.commandsFromRequests(m.inspections.Select(node))
 	}
-	if m.selectedValue.node.NodeID == node.NodeID && (m.selectedValue.subscribing || m.selectedValue.updates != nil) {
-		m.details = liveValueDetailLines(m.selectedValue)
-		return nil
+	requests := m.inspections.Select(node)
+	if selected, ok := m.inspections.Selected(); ok {
+		m.details = liveValueDetailLines(selected)
 	}
-	cancel := m.cancelSelectedValue()
-	subscribe := subscribeSelectedValueCmd(m.client, node.NodeID)
-	readDetails := readSelectedNodeDetailsCmd(m.client, node.NodeID)
-	m.selectedValue = selectedValueState{node: node, subscribing: true, loadingDetails: true}
-	m.details = liveValueDetailLines(m.selectedValue)
 	m.statusLine = "Read-Only Mode · loading selected Live Value"
-	if cancel == nil {
-		return tea.Batch(subscribe, readDetails)
-	}
-	return tea.Batch(cancel, subscribe, readDetails)
-}
-
-func (m *Model) cancelSelectedValue() tea.Cmd {
-	if m.selectedValue.subscription == nil && m.selectedValue.node.NodeID == "" {
-		return nil
-	}
-	cmd := cancelSubscriptionCmd(m.selectedValue.subscription)
-	m.selectedValue = selectedValueState{}
-	return cmd
+	return m.commandsFromRequests(requests)
 }
 
 func (m Model) applySelectedValueSubscribed(msg selectedValueSubscribedMsg) (tea.Model, tea.Cmd) {
-	if m.selectedValue.node.NodeID != msg.NodeID {
-		if msg.Subscription != nil {
-			return m, cancelSubscriptionCmd(msg.Subscription)
-		}
-		return m, nil
-	}
-	m.selectedValue.subscribing = false
+	requests := m.inspections.ApplySubscription(msg.NodeID, msg.Updates, msg.Subscription, msg.Err)
 	if msg.Err != nil {
 		log.Printf("selected-node subscription failed: nodeID=%s error=%v", msg.NodeID, msg.Err)
-		m.selectedValue.err = msg.Err
-		m.details = liveValueDetailLines(m.selectedValue)
 		m.statusLine = "Read-Only Mode · selected Live Value failed"
-		return m, nil
+	} else {
+		m.statusLine = "Read-Only Mode · selected Live Value active"
 	}
-	m.selectedValue.updates = msg.Updates
-	m.selectedValue.subscription = msg.Subscription
-	m.details = liveValueDetailLines(m.selectedValue)
-	m.statusLine = "Read-Only Mode · selected Live Value active"
-	if msg.Updates == nil {
-		return m, nil
+	if selected, ok := m.inspections.Selected(); ok {
+		m.details = liveValueDetailLines(selected)
 	}
-	return m, waitForSelectedValueCmd(msg.NodeID, msg.Updates)
+	return m, m.commandsFromRequests(requests)
 }
 
 func (m Model) applySelectedValue(msg selectedValueMsg) (tea.Model, tea.Cmd) {
-	if m.selectedValue.node.NodeID != msg.NodeID {
-		return m, nil
+	requests := m.inspections.ApplyLiveValue(msg.NodeID, msg.Value, msg.Err)
+	if selected, ok := m.inspections.Selected(); ok {
+		m.details = liveValueDetailLines(selected)
+		if msg.Err != nil && selected.Node.NodeID == msg.NodeID {
+			m.statusLine = "Read-Only Mode · selected Live Value stale"
+		} else if selected.Node.NodeID == msg.NodeID {
+			m.statusLine = fmt.Sprintf("Read-Only Mode · selected Live Value updated · %s", selected.Node.DisplayName)
+		}
 	}
-	if msg.Err != nil {
-		m.selectedValue.err = msg.Err
-		m.selectedValue.stale = true
-		m.details = liveValueDetailLines(m.selectedValue)
-		m.statusLine = "Read-Only Mode · selected Live Value stale"
-		return m, nil
-	}
-	m.selectedValue.value = msg.Value
-	m.selectedValue.err = nil
-	m.selectedValue.stale = false
-	m.details = liveValueDetailLines(m.selectedValue)
-	m.statusLine = fmt.Sprintf("Read-Only Mode · selected Live Value updated · %s", m.selectedValue.node.DisplayName)
-	if m.selectedValue.updates == nil {
-		return m, nil
-	}
-	return m, waitForSelectedValueCmd(msg.NodeID, m.selectedValue.updates)
+	return m, m.commandsFromRequests(requests)
 }
 
 func (m Model) applySelectedNodeDetails(msg selectedNodeDetailsMsg) (tea.Model, tea.Cmd) {
-	if m.selectedValue.node.NodeID != msg.NodeID {
-		return m, nil
+	m.inspections.ApplyDetails(msg.NodeID, msg.Details, msg.Err)
+	if selected, ok := m.inspections.Selected(); ok {
+		m.details = liveValueDetailLines(selected)
 	}
-	m.selectedValue.loadingDetails = false
-	if msg.Err != nil {
-		m.selectedValue.detailsErr = msg.Err
-		m.details = liveValueDetailLines(m.selectedValue)
-		return m, nil
-	}
-	m.selectedValue.details = msg.Details
-	m.details = liveValueDetailLines(m.selectedValue)
 	return m, nil
-}
-
-func (m Model) watchIndexByNodeID(nodeID string) int {
-	for i, item := range m.watchlist {
-		if item.node.NodeID == nodeID {
-			return i
-		}
-	}
-	return -1
 }
 
 func (m *Model) applyBrowseResult(msg browseChildrenMsg) {
@@ -833,7 +716,8 @@ func (m *Model) ensureSelectedTreeVisible(total int, pageSize int) {
 }
 
 func (m *Model) ensureSelectedWatchVisible(pageSize int) {
-	if len(m.watchlist) == 0 {
+	watched := m.inspections.Watched()
+	if len(watched) == 0 {
 		m.selectedWatch = 0
 		m.watchScroll = 0
 		return
@@ -844,8 +728,8 @@ func (m *Model) ensureSelectedWatchVisible(pageSize int) {
 	if m.selectedWatch < 0 {
 		m.selectedWatch = 0
 	}
-	if m.selectedWatch >= len(m.watchlist) {
-		m.selectedWatch = len(m.watchlist) - 1
+	if m.selectedWatch >= len(watched) {
+		m.selectedWatch = len(watched) - 1
 	}
 	if m.selectedWatch < m.watchScroll {
 		m.watchScroll = m.selectedWatch
@@ -853,7 +737,7 @@ func (m *Model) ensureSelectedWatchVisible(pageSize int) {
 	if m.selectedWatch >= m.watchScroll+pageSize {
 		m.watchScroll = m.selectedWatch - pageSize + 1
 	}
-	maxScroll := len(m.watchlist) - pageSize
+	maxScroll := len(watched) - pageSize
 	if maxScroll < 0 {
 		maxScroll = 0
 	}
@@ -919,48 +803,48 @@ func nodeDetailLines(node opcua.AddressNode) []string {
 	return lines
 }
 
-func liveValueDetailLines(state selectedValueState) []string {
-	lines := nodeDetailLines(state.node)
+func liveValueDetailLines(state session.VariableNodeInspection) []string {
+	lines := nodeDetailLines(state.Node)
 	lines = append(lines, "", labelStyle.Render("Live Value"))
-	if state.err != nil {
+	if state.Err != nil {
 		status := "Subscription failed"
-		if state.stale {
+		if state.Stale {
 			status = "Stale Value"
 		}
-		return append(lines, status+": "+state.err.Error())
+		return append(lines, status+": "+state.Err.Error())
 	}
-	if state.subscribing {
+	if state.Subscribing {
 		lines = append(lines, "Subscribing to selected Variable Node…")
-	} else if state.value.Value == "" {
+	} else if state.Value.Value == "" {
 		lines = append(lines, "Waiting for first Live Value…")
 	} else {
 		lines = append(lines,
-			labelStyle.Render("Value")+": "+state.value.Value,
-			labelStyle.Render("Health")+": "+compactStatus(state.value.Status),
+			labelStyle.Render("Value")+": "+state.Value.Value,
+			labelStyle.Render("Health")+": "+compactStatus(state.Value.Status),
 		)
-		if outOfRange, ok := outOfRangeText(state.value.Value, state.details.EURange); ok {
-			lines = append(lines, labelStyle.Render("Out-of-Range")+": "+outOfRange)
+		if state.OutOfRange != "" {
+			lines = append(lines, labelStyle.Render("Out-of-Range")+": "+state.OutOfRange)
 		}
-		if !state.value.SourceTimestamp.IsZero() {
-			lines = append(lines, labelStyle.Render("Source Timestamp")+": "+state.value.SourceTimestamp.Local().Format(time.RFC3339))
-			lines = append(lines, labelStyle.Render("Age")+": "+compactAge(time.Since(state.value.SourceTimestamp)))
+		if !state.Value.SourceTimestamp.IsZero() {
+			lines = append(lines, labelStyle.Render("Source Timestamp")+": "+state.Value.SourceTimestamp.Local().Format(time.RFC3339))
+			lines = append(lines, labelStyle.Render("Age")+": "+compactAge(time.Since(state.Value.SourceTimestamp)))
 		}
-		if !state.value.ServerTimestamp.IsZero() {
-			lines = append(lines, labelStyle.Render("Server Timestamp")+": "+state.value.ServerTimestamp.Local().Format(time.RFC3339))
+		if !state.Value.ServerTimestamp.IsZero() {
+			lines = append(lines, labelStyle.Render("Server Timestamp")+": "+state.Value.ServerTimestamp.Local().Format(time.RFC3339))
 		}
-		if state.stale {
+		if state.Stale {
 			lines = append(lines, "", "Stale Value: subscription is no longer active.")
 		}
 	}
 
 	lines = append(lines, "", labelStyle.Render("Metadata"))
-	if state.loadingDetails {
+	if state.LoadingDetails {
 		return append(lines, "Loading Variable Node metadata…")
 	}
-	if state.detailsErr != nil {
-		return append(lines, "Metadata unavailable: "+state.detailsErr.Error())
+	if state.DetailsErr != nil {
+		return append(lines, "Metadata unavailable: "+state.DetailsErr.Error())
 	}
-	return append(lines, nodeMetadataLines(state.details)...)
+	return append(lines, nodeMetadataLines(state.Details)...)
 }
 
 func nodeMetadataLines(details opcua.NodeDetails) []string {
@@ -996,23 +880,6 @@ func formatRange(valueRange *opcua.ValueRange) string {
 		return ""
 	}
 	return fmt.Sprintf("%g…%g", valueRange.Low, valueRange.High)
-}
-
-func outOfRangeText(value string, valueRange *opcua.ValueRange) (string, bool) {
-	if valueRange == nil {
-		return "", false
-	}
-	numeric, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
-	if err != nil {
-		return "", false
-	}
-	if numeric < valueRange.Low {
-		return fmt.Sprintf("%g is below %g", numeric, valueRange.Low), true
-	}
-	if numeric > valueRange.High {
-		return fmt.Sprintf("%g is above %g", numeric, valueRange.High), true
-	}
-	return "", false
 }
 
 func compactAge(age time.Duration) string {
