@@ -1,0 +1,69 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+build/
+out/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+coverage.txt
+coverage.html
+coverage/
+
+# Profiling / benchmarking outputs
+*.prof
+*.pprof
+*.trace
+
+# Dependency directories (safe to ignore if using Go modules without checking in vendor)
+vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# OS Specific
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment / local secrets
+.env
+.env.*
+!.env.example
+
+# Scratch space
+tmp/
+temp/
+.cache/
+
+# Project specific local debugging & artifacts
+# Generated binaries and visual tape outputs (e.g. from VHS)
+artifacts/
+tapes/
+Makefile.tapes
+
+# Portable-mode local app state
+termua-config/
+termua-cache/
+
+# Application logs (e.g. Bubble Tea headless debug log)
+*.log
+debug.log
