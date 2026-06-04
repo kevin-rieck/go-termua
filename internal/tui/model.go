@@ -45,6 +45,19 @@ type browseChildrenMsg struct {
 	Err          error
 }
 
+type watchSubscribedMsg struct {
+	NodeID       string
+	Updates      <-chan opcua.LiveValue
+	Subscription opcua.ValueSubscription
+	Err          error
+}
+
+type watchValueMsg struct {
+	NodeID string
+	Value  opcua.LiveValue
+	Err    error
+}
+
 type treeNode struct {
 	node           opcua.AddressNode
 	depth          int
@@ -52,6 +65,16 @@ type treeNode struct {
 	childrenLoaded bool
 	loading        bool
 	err            error
+}
+
+type watchItem struct {
+	node         opcua.AddressNode
+	updates      <-chan opcua.LiveValue
+	subscription opcua.ValueSubscription
+	value        opcua.LiveValue
+	subscribing  bool
+	err          error
+	updateCount  int
 }
 
 type Model struct {
@@ -72,6 +95,9 @@ type Model struct {
 	tree             []treeNode
 	selectedTree     int
 	treeScroll       int
+	watchlist        []watchItem
+	selectedWatch    int
+	watchScroll      int
 }
 
 func NewModel(deps Dependencies) Model {
@@ -136,18 +162,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.moveEndpointSelection(-1)
 			} else if m.focus == focusTree {
 				m.moveTreeSelection(-1)
+			} else if m.focus == focusWatchlist {
+				m.moveWatchSelection(-1)
 			}
 		case "down", "j":
 			if m.hasEndpointSelection() {
 				m.moveEndpointSelection(1)
 			} else if m.focus == focusTree {
 				m.moveTreeSelection(1)
+			} else if m.focus == focusWatchlist {
+				m.moveWatchSelection(1)
 			}
 		case "enter", "right", "l":
 			if cmd := m.connectSelectedEndpoint(); cmd != nil {
 				return m, cmd
 			}
 			if cmd := m.expandSelectedNode(); cmd != nil {
+				return m, cmd
+			}
+		case "w":
+			if cmd := m.addSelectedNodeToWatchlist(); cmd != nil {
 				return m, cmd
 			}
 		case "left", "h":
@@ -183,6 +217,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.startBrowse("i=85")
 	case browseChildrenMsg:
 		m.applyBrowseResult(msg)
+	case watchSubscribedMsg:
+		return m.applyWatchSubscribed(msg)
+	case watchValueMsg:
+		return m.applyWatchValue(msg)
 	}
 	return m, nil
 }
@@ -201,14 +239,11 @@ func (m Model) View() string {
 		leftWidth = innerWidth - gap - rightWidth
 	}
 	mainHeight := m.mainPanelHeight()
-	watchHeight := 6
-	if mainHeight < 16 {
-		watchHeight = 4
-	}
+	watchHeight := m.watchPanelHeight(mainHeight)
 
 	left := m.panel("Address Space", m.addressSpaceLines(mainHeight), leftWidth, mainHeight, m.focus == focusTree)
 	right := m.panel("Node Details", m.details, rightWidth, mainHeight, m.focus == focusDetails)
-	watchlist := m.panel("Watchlist", []string{"No Variable Nodes added yet.", "Select a Variable Node and press w to keep its Live Value visible."}, innerWidth, watchHeight, m.focus == focusWatchlist)
+	watchlist := m.panel("Watchlist", m.watchlistLines(watchHeight), innerWidth, watchHeight, m.focus == focusWatchlist)
 
 	body := lipgloss.JoinVertical(lipgloss.Left,
 		m.topBar(innerWidth),
@@ -217,6 +252,82 @@ func (m Model) View() string {
 		m.footer(innerWidth),
 	)
 	return m.frame(body)
+}
+
+func (m Model) watchlistLines(panelHeight int) []string {
+	if len(m.watchlist) == 0 {
+		return []string{"No Variable Nodes added yet.", "Select a Variable Node and press w to subscribe its Live Value."}
+	}
+
+	pageSize := m.watchlistPageSize(panelHeight)
+	start := clamp(m.watchScroll, 0, max(0, len(m.watchlist)-1))
+	end := start + pageSize
+	if end > len(m.watchlist) {
+		end = len(m.watchlist)
+	}
+
+	lines := make([]string, 0, pageSize*2+1)
+	if start > 0 {
+		lines = append(lines, mutedStyle.Render(fmt.Sprintf("↑ %d earlier", start)))
+	}
+	for i, item := range m.watchlist[start:end] {
+		watchIndex := start + i
+		state := "subscribing…"
+		if item.err != nil {
+			state = "subscription failed: " + item.err.Error()
+		} else if item.value.Value != "" {
+			stamp := compactTimestamp(item.value.SourceTimestamp)
+			if stamp == "" {
+				stamp = compactTimestamp(item.value.ServerTimestamp)
+			}
+			state = fmt.Sprintf("%s · %s", ellipsize(item.value.Value, 48), compactStatus(item.value.Status))
+			if stamp != "" {
+				state += " · " + stamp
+			}
+		} else if !item.subscribing {
+			state = "waiting for first Live Value…"
+		}
+		marker := "•"
+		if m.focus == focusWatchlist && watchIndex == m.selectedWatch {
+			marker = "›"
+		}
+		lines = append(lines, fmt.Sprintf("%s %s = %s", marker, item.node.DisplayName, state), "  "+mutedStyle.Render(ellipsize(item.node.NodeID, 72)))
+	}
+	if end < len(m.watchlist) {
+		lines = append(lines, mutedStyle.Render(fmt.Sprintf("↓ %d more", len(m.watchlist)-end)))
+	}
+	return lines
+}
+
+func (m Model) watchlistPageSize(panelHeight int) int {
+	bodyLines := panelHeight - panelStyle.GetVerticalFrameSize() - 1
+	// Each Watchlist item takes two lines; keep room for scroll affordances.
+	pageSize := bodyLines / 2
+	if pageSize < 1 {
+		return 1
+	}
+	return pageSize
+}
+
+func compactTimestamp(ts time.Time) string {
+	if ts.IsZero() {
+		return ""
+	}
+	return ts.Local().Format("15:04:05")
+}
+
+func compactStatus(status string) string {
+	if strings.Contains(status, "StatusOK") || strings.Contains(status, "StatusGood") || status == "0" {
+		return "OK"
+	}
+	return status
+}
+
+func ellipsize(value string, maxLength int) string {
+	if maxLength < 1 || len(value) <= maxLength {
+		return value
+	}
+	return value[:maxLength-1] + "…"
 }
 
 func (m Model) addressSpaceLines(panelHeight int) []string {
@@ -276,7 +387,9 @@ func (m Model) footer(width int) string {
 	if m.hasEndpointSelection() {
 		rightHint = "↑/↓ endpoint · Enter connect · ? help · q quit"
 	} else if m.focus == focusTree && m.connected {
-		rightHint = "↑/↓ node · Enter expand · ← collapse · ? help · q quit"
+		rightHint = "↑/↓ node · Enter expand · w watch · ← collapse · ? help · q quit"
+	} else if m.focus == focusWatchlist {
+		rightHint = "↑/↓ scroll Watchlist · Tab focus · ? help · q quit"
 	}
 	right := footerStyle.Render(rightHint)
 	space := width - lipgloss.Width(left) - lipgloss.Width(right)
@@ -362,6 +475,27 @@ func browseChildrenCmd(client opcua.Client, parentNodeID string) tea.Cmd {
 	}
 }
 
+func subscribeValueCmd(client opcua.Client, nodeID string) tea.Cmd {
+	return func() tea.Msg {
+		log.Printf("watchlist subscription started: nodeID=%s", nodeID)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		updates, subscription, err := client.SubscribeValue(ctx, nodeID)
+		return watchSubscribedMsg{NodeID: nodeID, Updates: updates, Subscription: subscription, Err: err}
+	}
+}
+
+func waitForWatchValueCmd(nodeID string, updates <-chan opcua.LiveValue) tea.Cmd {
+	return func() tea.Msg {
+		value, ok := <-updates
+		if !ok {
+			return watchValueMsg{NodeID: nodeID, Err: fmt.Errorf("subscription closed")}
+		}
+		return watchValueMsg{NodeID: nodeID, Value: value}
+	}
+}
+
 func (m *Model) moveTreeSelection(delta int) {
 	visible := m.visibleTree()
 	if len(visible) == 0 {
@@ -370,6 +504,16 @@ func (m *Model) moveTreeSelection(delta int) {
 	m.selectedTree = (m.selectedTree + delta + len(visible)) % len(visible)
 	m.ensureSelectedTreeVisible(len(visible), m.addressTreePageSize(m.mainPanelHeight()))
 	m.details = nodeDetailLines(visible[m.selectedTree].node)
+}
+
+func (m *Model) moveWatchSelection(delta int) {
+	if len(m.watchlist) == 0 {
+		m.selectedWatch = 0
+		m.watchScroll = 0
+		return
+	}
+	m.selectedWatch = (m.selectedWatch + delta + len(m.watchlist)) % len(m.watchlist)
+	m.ensureSelectedWatchVisible(m.watchlistPageSize(m.watchPanelHeight(m.mainPanelHeight())))
 }
 
 func (m *Model) expandSelectedNode() tea.Cmd {
@@ -407,6 +551,74 @@ func (m *Model) collapseSelectedNode() {
 		return
 	}
 	m.tree[idx].expanded = false
+}
+
+func (m *Model) addSelectedNodeToWatchlist() tea.Cmd {
+	if !m.connected || m.client == nil {
+		return nil
+	}
+	idx := m.selectedTreeIndex()
+	if idx < 0 {
+		return nil
+	}
+	node := m.tree[idx].node
+	if node.NodeClass != "Variable" {
+		m.statusLine = "Read-Only Mode · select a Variable Node to watch"
+		return nil
+	}
+	if m.watchIndexByNodeID(node.NodeID) >= 0 {
+		m.statusLine = "Read-Only Mode · Variable Node already on Watchlist"
+		return nil
+	}
+	m.watchlist = append(m.watchlist, watchItem{node: node, subscribing: true})
+	m.selectedWatch = len(m.watchlist) - 1
+	m.ensureSelectedWatchVisible(m.watchlistPageSize(m.watchPanelHeight(m.mainPanelHeight())))
+	m.statusLine = "Read-Only Mode · subscribing Watchlist node"
+	return subscribeValueCmd(m.client, node.NodeID)
+}
+
+func (m Model) applyWatchSubscribed(msg watchSubscribedMsg) (tea.Model, tea.Cmd) {
+	idx := m.watchIndexByNodeID(msg.NodeID)
+	if idx < 0 {
+		return m, nil
+	}
+	m.watchlist[idx].subscribing = false
+	if msg.Err != nil {
+		log.Printf("watchlist subscription failed: nodeID=%s error=%v", msg.NodeID, msg.Err)
+		m.watchlist[idx].err = msg.Err
+		m.statusLine = "Read-Only Mode · Watchlist subscription failed"
+		return m, nil
+	}
+	m.watchlist[idx].updates = msg.Updates
+	m.watchlist[idx].subscription = msg.Subscription
+	m.statusLine = "Read-Only Mode · Watchlist subscription active"
+	return m, waitForWatchValueCmd(msg.NodeID, msg.Updates)
+}
+
+func (m Model) applyWatchValue(msg watchValueMsg) (tea.Model, tea.Cmd) {
+	idx := m.watchIndexByNodeID(msg.NodeID)
+	if idx < 0 {
+		return m, nil
+	}
+	if msg.Err != nil {
+		m.watchlist[idx].err = msg.Err
+		m.statusLine = "Read-Only Mode · Watchlist subscription closed"
+		return m, nil
+	}
+	m.watchlist[idx].value = msg.Value
+	m.watchlist[idx].err = nil
+	m.watchlist[idx].updateCount++
+	m.statusLine = fmt.Sprintf("Read-Only Mode · Watchlist updated · %s", m.watchlist[idx].node.DisplayName)
+	return m, waitForWatchValueCmd(msg.NodeID, m.watchlist[idx].updates)
+}
+
+func (m Model) watchIndexByNodeID(nodeID string) int {
+	for i, item := range m.watchlist {
+		if item.node.NodeID == nodeID {
+			return i
+		}
+	}
+	return -1
 }
 
 func (m *Model) applyBrowseResult(msg browseChildrenMsg) {
@@ -470,6 +682,39 @@ func (m *Model) ensureSelectedTreeVisible(total int, pageSize int) {
 	}
 }
 
+func (m *Model) ensureSelectedWatchVisible(pageSize int) {
+	if len(m.watchlist) == 0 {
+		m.selectedWatch = 0
+		m.watchScroll = 0
+		return
+	}
+	if pageSize < 1 {
+		pageSize = 1
+	}
+	if m.selectedWatch < 0 {
+		m.selectedWatch = 0
+	}
+	if m.selectedWatch >= len(m.watchlist) {
+		m.selectedWatch = len(m.watchlist) - 1
+	}
+	if m.selectedWatch < m.watchScroll {
+		m.watchScroll = m.selectedWatch
+	}
+	if m.selectedWatch >= m.watchScroll+pageSize {
+		m.watchScroll = m.selectedWatch - pageSize + 1
+	}
+	maxScroll := len(m.watchlist) - pageSize
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.watchScroll > maxScroll {
+		m.watchScroll = maxScroll
+	}
+	if m.watchScroll < 0 {
+		m.watchScroll = 0
+	}
+}
+
 func (m Model) visibleTreeWindow(visible []treeNode, pageSize int) []treeNode {
 	if pageSize < 1 {
 		pageSize = 1
@@ -483,7 +728,14 @@ func (m Model) visibleTreeWindow(visible []treeNode, pageSize int) []treeNode {
 }
 
 func (m Model) mainPanelHeight() int {
-	return clamp(m.height-9, 12, 24)
+	return clamp(m.height-12, 12, 24)
+}
+
+func (m Model) watchPanelHeight(mainHeight int) int {
+	if mainHeight < 16 {
+		return 6
+	}
+	return 9
 }
 
 func (m Model) addressTreePageSize(panelHeight int) int {

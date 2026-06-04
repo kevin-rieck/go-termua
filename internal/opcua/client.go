@@ -8,6 +8,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"time"
 
 	gopcua "github.com/gopcua/opcua"
 	"github.com/gopcua/opcua/id"
@@ -20,7 +21,13 @@ type Client interface {
 	DiscoverEndpoints(ctx context.Context, endpoint string) ([]Endpoint, error)
 	Connect(ctx context.Context, request ConnectRequest) error
 	BrowseChildren(ctx context.Context, nodeID string) ([]AddressNode, error)
+	SubscribeValue(ctx context.Context, nodeID string) (<-chan LiveValue, ValueSubscription, error)
 	Close(ctx context.Context) error
+}
+
+// ValueSubscription is an active monitored item subscription.
+type ValueSubscription interface {
+	Cancel(ctx context.Context) error
 }
 
 // Endpoint is the app-level projection of an OPC UA endpoint description.
@@ -51,6 +58,15 @@ type AddressNode struct {
 	NodeClass   string
 }
 
+// LiveValue is the app-level projection of a subscribed Variable Node value.
+type LiveValue struct {
+	NodeID          string
+	Value           string
+	Status          string
+	SourceTimestamp time.Time
+	ServerTimestamp time.Time
+}
+
 type AuthType string
 
 const (
@@ -64,7 +80,8 @@ func NewClient() Client {
 }
 
 type gopcuaClient struct {
-	client *gopcua.Client
+	client        *gopcua.Client
+	subscriptions []ValueSubscription
 }
 
 func (c *gopcuaClient) DiscoverEndpoints(ctx context.Context, endpoint string) ([]Endpoint, error) {
@@ -96,6 +113,11 @@ func (c *gopcuaClient) Connect(ctx context.Context, request ConnectRequest) erro
 		log.Printf("opcua: SelectEndpoint failed endpoint=%s securityPolicy=%s securityMode=%s error=%v", request.Endpoint, request.SecurityPolicy, request.SecurityMode, err)
 		return err
 	}
+	// Some OPC UA Servers advertise an endpoint URL that is reachable from the
+	// server host but not from this client environment (for example VHS running
+	// inside Docker). Preserve the selected security/auth metadata while dialing
+	// the endpoint the Automation Engineer supplied.
+	ep.EndpointURL = request.Endpoint
 
 	authType := ua.UserTokenTypeAnonymous
 	opts := []gopcua.Option{
@@ -160,7 +182,47 @@ func (c *gopcuaClient) BrowseChildren(ctx context.Context, nodeID string) ([]Add
 	return nodes, nil
 }
 
+func (c *gopcuaClient) SubscribeValue(ctx context.Context, nodeID string) (<-chan LiveValue, ValueSubscription, error) {
+	if c.client == nil {
+		return nil, nil, ua.StatusBadServerNotConnected
+	}
+	parsedNodeID, err := ua.ParseNodeID(nodeID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	notifyCh := make(chan *gopcua.PublishNotificationData, 8)
+	sub, err := c.client.Subscribe(ctx, &gopcua.SubscriptionParameters{Interval: opcuaSubscriptionInterval}, notifyCh)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	request := gopcua.NewMonitoredItemCreateRequestWithDefaults(parsedNodeID, ua.AttributeIDValue, uint32(len(c.subscriptions)+1))
+	res, err := sub.Monitor(ctx, ua.TimestampsToReturnBoth, request)
+	if err != nil {
+		_ = sub.Cancel(ctx)
+		return nil, nil, err
+	}
+	if len(res.Results) == 0 || res.Results[0].StatusCode != ua.StatusOK {
+		_ = sub.Cancel(ctx)
+		if len(res.Results) == 0 {
+			return nil, nil, fmt.Errorf("monitor %s failed: no result", nodeID)
+		}
+		return nil, nil, fmt.Errorf("monitor %s failed: %s", nodeID, res.Results[0].StatusCode)
+	}
+
+	values := make(chan LiveValue, 8)
+	go forwardValueNotifications(nodeID, notifyCh, values)
+	c.subscriptions = append(c.subscriptions, sub)
+	log.Printf("opcua: SubscribeValue succeeded nodeID=%s subscriptionID=%d", nodeID, sub.SubscriptionID)
+	return values, sub, nil
+}
+
 func (c *gopcuaClient) Close(ctx context.Context) error {
+	for _, sub := range c.subscriptions {
+		_ = sub.Cancel(ctx)
+	}
+	c.subscriptions = nil
 	if c.client == nil {
 		return nil
 	}
@@ -168,6 +230,43 @@ func (c *gopcuaClient) Close(ctx context.Context) error {
 	c.client = nil
 	return err
 }
+
+func forwardValueNotifications(nodeID string, notifyCh <-chan *gopcua.PublishNotificationData, values chan<- LiveValue) {
+	defer close(values)
+	for notification := range notifyCh {
+		if notification == nil || notification.Error != nil {
+			continue
+		}
+		dataChange, ok := notification.Value.(*ua.DataChangeNotification)
+		if !ok {
+			continue
+		}
+		for _, item := range dataChange.MonitoredItems {
+			if item == nil || item.Value == nil {
+				continue
+			}
+			values <- liveValueFromDataValue(nodeID, item.Value)
+		}
+	}
+}
+
+func liveValueFromDataValue(nodeID string, data *ua.DataValue) LiveValue {
+	value := "<nil>"
+	status := "Unknown"
+	var sourceTimestamp time.Time
+	var serverTimestamp time.Time
+	if data != nil {
+		if data.Value != nil {
+			value = fmt.Sprint(data.Value.Value())
+		}
+		status = fmt.Sprint(data.Status)
+		sourceTimestamp = data.SourceTimestamp
+		serverTimestamp = data.ServerTimestamp
+	}
+	return LiveValue{NodeID: nodeID, Value: value, Status: status, SourceTimestamp: sourceTimestamp, ServerTimestamp: serverTimestamp}
+}
+
+var opcuaSubscriptionInterval = 1 * time.Second
 
 func addressNodeFromReference(ref *ua.ReferenceDescription) AddressNode {
 	nodeID := ""
@@ -192,8 +291,12 @@ func addressNodeFromReference(ref *ua.ReferenceDescription) AddressNode {
 		NodeID:      nodeID,
 		DisplayName: displayName,
 		BrowseName:  browseName,
-		NodeClass:   ref.NodeClass.String(),
+		NodeClass:   nodeClassName(ref.NodeClass.String()),
 	}
+}
+
+func nodeClassName(value string) string {
+	return strings.TrimPrefix(value, "NodeClass")
 }
 
 func endpointFromDescription(ep *ua.EndpointDescription) Endpoint {

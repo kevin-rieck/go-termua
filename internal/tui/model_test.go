@@ -172,6 +172,62 @@ func TestExpandSelectedNodeBrowsesLazily(t *testing.T) {
 	}
 }
 
+func TestWatchlistSubscribesSelectedVariableNode(t *testing.T) {
+	updates := make(chan opcua.LiveValue, 1)
+	client := &fakeClient{subscriptions: map[string]chan opcua.LiveValue{"ns=2;s=Temperature": updates}}
+	model := NewModel(Dependencies{Client: client})
+	model.connected = true
+	model.tree = []treeNode{
+		{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}, expanded: true, childrenLoaded: true},
+		{node: opcua.AddressNode{NodeID: "ns=2;s=Temperature", DisplayName: "Temperature", NodeClass: "Variable"}, depth: 1},
+	}
+	model.selectedTree = 1
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	if cmd == nil {
+		t.Fatal("expected subscribe command")
+	}
+	model = updated.(Model)
+	if len(model.watchlist) != 1 || !model.watchlist[0].subscribing {
+		t.Fatalf("watchlist = %#v", model.watchlist)
+	}
+
+	updated, cmd = model.Update(cmd())
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("expected wait-for-value command")
+	}
+
+	updates <- opcua.LiveValue{NodeID: "ns=2;s=Temperature", Value: "42.5", Status: "OK"}
+	updated, _ = model.Update(cmd())
+	view := updated.(Model).View()
+	if !strings.Contains(view, "Temperature") || !strings.Contains(view, "42.5 · OK") {
+		t.Fatalf("expected subscribed Live Value in watchlist:\n%s", view)
+	}
+}
+
+func TestWatchlistScrollsWhenFocused(t *testing.T) {
+	model := NewModel(Dependencies{})
+	model.focus = focusWatchlist
+	for i := 0; i < 5; i++ {
+		model.watchlist = append(model.watchlist, watchItem{node: opcua.AddressNode{NodeID: fmt.Sprintf("ns=2;s=Node%d", i), DisplayName: fmt.Sprintf("Node%d", i), NodeClass: "Variable"}})
+	}
+
+	updated := tea.Model(model)
+	for i := 0; i < 3; i++ {
+		updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyDown})
+	}
+	model = updated.(Model)
+	lines := strings.Join(model.watchlistLines(9), "\n")
+
+	if model.watchScroll == 0 {
+		t.Fatal("expected Watchlist to scroll")
+	}
+	if !strings.Contains(lines, "Node3") || strings.Contains(lines, "Node0 =") {
+		t.Fatalf("expected Watchlist window around selected item, got:\n%s", lines)
+	}
+}
+
 func TestInitDiscoversEndpointWhenProvided(t *testing.T) {
 	client := &fakeClient{endpoints: []opcua.Endpoint{{SecurityMode: "None", SecurityPolicy: "None"}}}
 	model := NewModel(Dependencies{Client: client, Launch: app.LaunchOptions{Endpoint: "opc.tcp://localhost:4840"}})
@@ -189,10 +245,11 @@ func TestInitDiscoversEndpointWhenProvided(t *testing.T) {
 }
 
 type fakeClient struct {
-	discovered string
-	endpoints  []opcua.Endpoint
-	connected  opcua.ConnectRequest
-	children   map[string][]opcua.AddressNode
+	discovered    string
+	endpoints     []opcua.Endpoint
+	connected     opcua.ConnectRequest
+	children      map[string][]opcua.AddressNode
+	subscriptions map[string]chan opcua.LiveValue
 }
 
 func (f *fakeClient) DiscoverEndpoints(ctx context.Context, endpoint string) ([]opcua.Endpoint, error) {
@@ -209,4 +266,12 @@ func (f *fakeClient) BrowseChildren(ctx context.Context, nodeID string) ([]opcua
 	return f.children[nodeID], nil
 }
 
+func (f *fakeClient) SubscribeValue(ctx context.Context, nodeID string) (<-chan opcua.LiveValue, opcua.ValueSubscription, error) {
+	return f.subscriptions[nodeID], fakeSubscription{}, nil
+}
+
 func (f *fakeClient) Close(ctx context.Context) error { return nil }
+
+type fakeSubscription struct{}
+
+func (fakeSubscription) Cancel(ctx context.Context) error { return nil }
