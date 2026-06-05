@@ -16,13 +16,16 @@
 ## Core UX
 
 - Main navigation is Address Space tree-first.
-- Default layout is two-pane: tree + details. Watchlist is a tab/drawer/toggle.
+- Default layout is two-pane: Address Space tree on the left and a right pane with tabs for Node Details and Watchlist.
 - Start browsing at the OPC UA **Objects** root; Types/Views remain accessible as advanced navigation.
 - Selecting a Variable Node emphasizes Live Value first: value, health, timestamps/age, data type, and Engineering Unit when available.
 - Non-Variable nodes emphasize metadata and relationships.
 - Show DisplayName primarily; reveal BrowseName when different.
 - Show compact NodeId prominently and make Expanded NodeId copyable.
 - Use arrows/Enter/Esc/? as primary controls, with vim-like accelerators.
+- `Tab` cycles focus through Address Space, Node Details, and Watchlist; the right pane preserves the last active tab when focus returns to Address Space.
+- The Watchlist tab label shows the number of watched Variable Nodes.
+- Adding a Variable Node to the Watchlist does not automatically switch tabs.
 - Mouse support is optional; keyboard remains complete.
 - Persistent footer hints plus `?` help overlay for v1.
 - Persistent Read-Only Mode indicator.

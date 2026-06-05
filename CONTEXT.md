@@ -57,7 +57,7 @@ A previously observed Live Value that may no longer represent the current state 
 _Avoid_: Cached value, invalid value, old reading
 
 **Watchlist**:
-A user-selected set of Variable Nodes whose Live Values remain visible during a Troubleshooting Session.
+A user-selected set of Variable Nodes whose Live Values remain readily available during a Troubleshooting Session.
 _Avoid_: Dashboard, monitor, pinned nodes
 
 **Session Trend**:

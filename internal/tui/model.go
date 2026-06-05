@@ -26,10 +26,17 @@ type Dependencies struct {
 
 type focus int
 
+type rightPaneTab int
+
 const (
 	focusTree focus = iota
 	focusDetails
 	focusWatchlist
+)
+
+const (
+	rightPaneDetails rightPaneTab = iota
+	rightPaneWatchlist
 )
 
 type endpointDiscoveryMsg struct {
@@ -85,6 +92,7 @@ type Model struct {
 	selectedTree        int
 	treeScroll          int
 	inspections         *session.InspectionSet
+	rightPane           rightPaneTab
 	selectedWatch       int
 	watchScroll         int
 }
@@ -100,7 +108,7 @@ func NewModel(deps Dependencies) Model {
 		"Select a Variable Node to inspect its Live Value.",
 		"Health, age, timestamps, Engineering Unit, and NodeId will appear here.",
 		"",
-		"Watchlist is available as a v1 drawer/tab target.",
+		"Press Tab to switch between Node Details and Watchlist.",
 	}
 
 	if deps.Launch.Endpoint != "" {
@@ -126,6 +134,7 @@ func NewModel(deps Dependencies) Model {
 		connectionInput:     connectionInput,
 		addressSpace:        NewAddressSpace(),
 		inspections:         session.NewInspectionSet(),
+		rightPane:           rightPaneDetails,
 	}
 }
 
@@ -160,8 +169,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "tab":
 			m.focus = (m.focus + 1) % 3
+			m.syncRightPaneWithFocus()
 		case "shift+tab":
 			m.focus = (m.focus + 2) % 3
+			m.syncRightPaneWithFocus()
 		case "up", "k":
 			if m.hasEndpointSelection() {
 				m.moveEndpointSelection(-1)
@@ -186,15 +197,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if cmd := m.connectSelectedEndpoint(); cmd != nil {
 				return m, cmd
 			}
-			if cmd := m.expandSelectedNode(); cmd != nil {
-				return m, cmd
+			if m.focus == focusTree {
+				if cmd := m.expandSelectedNode(); cmd != nil {
+					return m, cmd
+				}
 			}
 		case "w":
 			if cmd := m.addSelectedNodeToWatchlist(); cmd != nil {
 				return m, cmd
 			}
 		case "left", "h":
-			m.collapseSelectedNode()
+			if m.focus == focusTree {
+				m.collapseSelectedNode()
+			}
 		}
 	case endpointDiscoveryMsg:
 		if msg.Err != nil {
@@ -250,21 +265,18 @@ func (m Model) View() string {
 		leftWidth = innerWidth - gap - rightWidth
 	}
 	mainHeight := m.mainPanelHeight()
-	watchHeight := m.watchPanelHeight(mainHeight)
 
-	left := m.panel("Address Space", m.addressSpaceLines(mainHeight), leftWidth, mainHeight, m.focus == focusTree)
-	right := m.panel("Node Details", m.details, rightWidth, mainHeight, m.focus == focusDetails)
-	watchlist := m.panel("Watchlist", m.watchlistLines(watchHeight), innerWidth, watchHeight, m.focus == focusWatchlist)
+	left := m.panel(panelTitleStyle.Render("Address Space"), m.addressSpaceLines(mainHeight), leftWidth, mainHeight, m.focus == focusTree)
+	right := m.panel(m.rightPaneTitle(), m.rightPaneLines(mainHeight), rightWidth, mainHeight, m.focus == focusDetails || m.focus == focusWatchlist)
 
 	body := lipgloss.JoinVertical(lipgloss.Left,
 		m.topBar(innerWidth),
 		lipgloss.JoinHorizontal(lipgloss.Top, left, strings.Repeat(" ", gap), right),
-		watchlist,
 		m.footer(innerWidth),
 	)
 	if m.connectionModalActive() {
 		modalTop := 6
-		modalMaxHeight := len(strings.Split(body, "\n")) - modalTop
+		modalMaxHeight := len(strings.Split(body, "\n")) - modalTop - 1
 		body = overlayCentered(body, m.connectionModalView(innerWidth, modalMaxHeight), innerWidth, modalTop)
 	}
 	return m.frame(body)
@@ -459,6 +471,32 @@ func (m *Model) discoverConnectionEndpoint() tea.Cmd {
 	return m.commandsFromConnectionRequests(requests)
 }
 
+func (m Model) rightPaneTitle() string {
+	detailsTab := mutedStyle.Render("Node Details")
+	watchlistTab := mutedStyle.Render(fmt.Sprintf("Watchlist (%d)", len(m.inspections.Watched())))
+	if m.rightPane == rightPaneWatchlist {
+		watchlistTab = panelTitleStyle.Render(fmt.Sprintf("Watchlist (%d)", len(m.inspections.Watched())))
+	} else {
+		detailsTab = panelTitleStyle.Render("Node Details")
+	}
+	return detailsTab + mutedStyle.Render(" | ") + watchlistTab
+}
+
+func (m Model) rightPaneLines(panelHeight int) []string {
+	if m.rightPane == rightPaneWatchlist {
+		return m.watchlistLines(panelHeight)
+	}
+	return m.details
+}
+
+func (m *Model) syncRightPaneWithFocus() {
+	if m.focus == focusDetails {
+		m.rightPane = rightPaneDetails
+	} else if m.focus == focusWatchlist {
+		m.rightPane = rightPaneWatchlist
+	}
+}
+
 func (m Model) watchlistLines(panelHeight int) []string {
 	watched := m.inspections.Watched()
 	if len(watched) == 0 {
@@ -628,8 +666,12 @@ func (m Model) panel(title string, lines []string, width int, height int, focuse
 	}
 
 	style = style.Width(contentWidth).Height(contentHeight)
-	body := wrapLines(lines, contentWidth, contentHeight-1)
-	return style.Render(panelTitleStyle.Render(title) + "\n" + body)
+	bodyLines := contentHeight - panelStyle.GetVerticalPadding() - 1
+	if bodyLines < 1 {
+		bodyLines = 1
+	}
+	body := wrapLines(lines, contentWidth, bodyLines)
+	return style.Render(title + "\n" + body)
 }
 
 func (m Model) helpView() string {
@@ -795,7 +837,7 @@ func (m *Model) moveWatchSelection(delta int) {
 		return
 	}
 	m.selectedWatch = (m.selectedWatch + delta + len(watched)) % len(watched)
-	m.ensureSelectedWatchVisible(m.watchlistPageSize(m.watchPanelHeight(m.mainPanelHeight())))
+	m.ensureSelectedWatchVisible(m.watchlistPageSize(m.mainPanelHeight()))
 }
 
 func (m *Model) expandSelectedNode() tea.Cmd {
@@ -847,7 +889,7 @@ func (m *Model) addSelectedNodeToWatchlist() tea.Cmd {
 	}
 	requests := m.inspections.Watch(node)
 	m.selectedWatch = len(m.inspections.Watched()) - 1
-	m.ensureSelectedWatchVisible(m.watchlistPageSize(m.watchPanelHeight(m.mainPanelHeight())))
+	m.ensureSelectedWatchVisible(m.watchlistPageSize(m.mainPanelHeight()))
 	m.statusLine = "Read-Only Mode · subscribing Watchlist node"
 	return m.commandsFromRequests(requests)
 }
@@ -997,14 +1039,7 @@ func (m Model) visibleTreeWindow(visible []ViewItem, pageSize int) []ViewItem {
 }
 
 func (m Model) mainPanelHeight() int {
-	return clamp(m.height-12, 12, 24)
-}
-
-func (m Model) watchPanelHeight(mainHeight int) int {
-	if mainHeight < 16 {
-		return 6
-	}
-	return 9
+	return clamp(m.height-8, 16, 30)
 }
 
 func (m Model) addressTreePageSize(panelHeight int) int {

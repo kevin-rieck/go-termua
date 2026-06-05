@@ -56,6 +56,120 @@ func TestConnectionModalOpensOnStartupWithoutEndpoint(t *testing.T) {
 	}
 }
 
+func TestWatchlistIsRightPaneTabInsteadOfBottomPanel(t *testing.T) {
+	model := NewModel(Dependencies{})
+	model.connectionModalOpen = false
+	view := model.View()
+
+	if !strings.Contains(view, "Node Details") || !strings.Contains(view, "Watchlist (0)") {
+		t.Fatalf("expected right pane tabs in view:\n%s", view)
+	}
+	if strings.Contains(view, "No Variable Nodes added yet.") {
+		t.Fatalf("expected Watchlist to be hidden until its tab is active, got:\n%s", view)
+	}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyTab})
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyTab})
+	view = updated.(Model).View()
+
+	if !strings.Contains(view, "No Variable Nodes added yet.") {
+		t.Fatalf("expected Watchlist content after tabbing to Watchlist:\n%s", view)
+	}
+}
+
+func TestRightPanePreservesWatchlistTabWhenFocusReturnsToAddressSpace(t *testing.T) {
+	model := NewModel(Dependencies{})
+	model.connectionModalOpen = false
+	model.inspections.Watch(opcua.AddressNode{NodeID: "ns=2;s=Temperature", DisplayName: "Temperature", NodeClass: "Variable"})
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyTab})
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyTab})
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyTab})
+	view := updated.(Model).View()
+
+	if !strings.Contains(view, "Temperature") || !strings.Contains(view, "subscribing") {
+		t.Fatalf("expected Watchlist tab to remain visible when Address Space regains focus:\n%s", view)
+	}
+}
+
+func TestAddressSpaceAndRightPaneRenderSameHeight(t *testing.T) {
+	model := NewModel(Dependencies{})
+	model.connectionModalOpen = false
+	view := model.View()
+
+	assertPanelsShareBottomBorder(t, view)
+}
+
+func TestAddressSpaceAndRightPaneStaySameHeightWithLongRightPaneContent(t *testing.T) {
+	model := NewModel(Dependencies{})
+	model.connectionModalOpen = false
+	model.details = make([]string, 0, 60)
+	for i := 0; i < 60; i++ {
+		model.details = append(model.details, fmt.Sprintf("Detail %02d: this is a long Node Details line that should wrap but must not make the right pane taller", i))
+	}
+
+	view := model.View()
+	assertPanelsShareBottomBorder(t, view)
+}
+
+func TestAddressSpaceAndRightPaneStaySameHeightWithLongWatchlist(t *testing.T) {
+	model := NewModel(Dependencies{})
+	model.connectionModalOpen = false
+	model.focus = focusWatchlist
+	model.rightPane = rightPaneWatchlist
+	for i := 0; i < 30; i++ {
+		model.inspections.Watch(opcua.AddressNode{NodeID: fmt.Sprintf("ns=2;s=VeryLongWatchlistNodeIdentifier%d", i), DisplayName: fmt.Sprintf("VeryLongWatchlistNodeDisplayName%d", i), NodeClass: "Variable"})
+	}
+
+	view := model.View()
+	assertPanelsShareBottomBorder(t, view)
+}
+
+func assertPanelsShareBottomBorder(t *testing.T, view string) {
+	t.Helper()
+	for _, line := range strings.Split(view, "\n") {
+		if strings.Count(line, "╰") == 2 && strings.Count(line, "╯") == 2 {
+			return
+		}
+	}
+	t.Fatalf("expected Address Space and right pane bottom borders on the same line:\n%s", view)
+}
+
+func TestArrowKeysDoNotControlAddressSpaceWhenNodeDetailsFocused(t *testing.T) {
+	client := &fakeClient{
+		children:      map[string][]opcua.AddressNode{"i=85": {{NodeID: "ns=2;s=Temperature", DisplayName: "Temperature", NodeClass: "Variable"}}},
+		subscriptions: map[string]chan opcua.LiveValue{"ns=2;s=Temperature": make(chan opcua.LiveValue, 1)},
+	}
+	model := NewModel(Dependencies{Client: client})
+	markModelConnected(&model)
+	model.connectionModalOpen = false
+	model.addressSpace = &AddressSpace{tree: []treeNode{
+		{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}},
+		{node: opcua.AddressNode{NodeID: "ns=2;s=Temperature", DisplayName: "Temperature", NodeClass: "Variable"}, depth: 1},
+	}}
+	model.focus = focusDetails
+	model.rightPane = rightPaneDetails
+	model.selectedTree = 0
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatal("expected Down to issue no Address Space command while Node Details is focused")
+	}
+	if model.selectedTree != 0 {
+		t.Fatalf("expected Down to leave Address Space selection put, selectedTree=%d", model.selectedTree)
+	}
+
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatal("expected Right to issue no Address Space command while Node Details is focused")
+	}
+	if model.addressSpace.tree[0].expanded {
+		t.Fatal("expected Right to leave Address Space node collapsed while Node Details is focused")
+	}
+}
+
 func TestOverlayCenteredPreservesUnderlyingPanelEdges(t *testing.T) {
 	base := strings.Join([]string{
 		"┌──────────────────┐",
@@ -368,9 +482,17 @@ func TestWatchlistSubscribesSelectedVariableNode(t *testing.T) {
 
 	updates <- opcua.LiveValue{NodeID: "ns=2;s=Temperature", Value: "42.5", Status: "OK"}
 	updated, _ = model.Update(waitCmd())
-	view := updated.(Model).View()
+	model = updated.(Model)
+	view := model.View()
+	if !strings.Contains(view, "Watchlist (1)") || strings.Contains(view, "42.5 · OK") {
+		t.Fatalf("expected Watchlist count without switching tabs:\n%s", view)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyTab})
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyTab})
+	view = updated.(Model).View()
 	if !strings.Contains(view, "Temperature") || !strings.Contains(view, "42.5 · OK") {
-		t.Fatalf("expected subscribed Live Value in watchlist:\n%s", view)
+		t.Fatalf("expected subscribed Live Value in Watchlist tab:\n%s", view)
 	}
 }
 
@@ -485,22 +607,24 @@ func TestSelectingNonVariableCancelsSelectedLiveValue(t *testing.T) {
 func TestWatchlistScrollsWhenFocused(t *testing.T) {
 	model := NewModel(Dependencies{})
 	model.connectionModalOpen = false
+	model.height = 12
 	model.focus = focusWatchlist
-	for i := 0; i < 5; i++ {
+	model.rightPane = rightPaneWatchlist
+	for i := 0; i < 9; i++ {
 		model.inspections.Watch(opcua.AddressNode{NodeID: fmt.Sprintf("ns=2;s=Node%d", i), DisplayName: fmt.Sprintf("Node%d", i), NodeClass: "Variable"})
 	}
 
 	updated := tea.Model(model)
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 7; i++ {
 		updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyDown})
 	}
 	model = updated.(Model)
-	lines := strings.Join(model.watchlistLines(9), "\n")
+	lines := strings.Join(model.watchlistLines(model.mainPanelHeight()), "\n")
 
 	if model.watchScroll == 0 {
 		t.Fatal("expected Watchlist to scroll")
 	}
-	if !strings.Contains(lines, "Node3") || strings.Contains(lines, "Node0 =") {
+	if !strings.Contains(lines, "Node7") || strings.Contains(lines, "Node0 =") {
 		t.Fatalf("expected Watchlist window around selected item, got:\n%s", lines)
 	}
 }
