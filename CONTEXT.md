@@ -79,3 +79,7 @@ _Avoid_: Session, profile, login
 **Saved Connection**:
 A locally stored set of non-secret details used to reconnect to an OPC UA Server.
 _Avoid_: Profile, bookmark, credential
+
+**Endpoint Discovery**:
+The step where the OPC UA Client TUI asks an OPC UA Server for its advertised connection endpoints before a Server Connection is established.
+_Avoid_: Endpoint browsing, connection browsing

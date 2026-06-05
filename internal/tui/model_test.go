@@ -40,6 +40,127 @@ func TestInitialViewShowsReadOnlyMode(t *testing.T) {
 	}
 }
 
+func TestConnectionModalOpensOnStartupWithoutEndpoint(t *testing.T) {
+	model := NewModel(Dependencies{})
+	view := model.View()
+
+	if !strings.Contains(view, "Connect to OPC UA Server") {
+		t.Fatalf("expected Connection Modal on startup:\n%s", view)
+	}
+	if !strings.Contains(view, "Enter server URL") {
+		t.Fatalf("expected server URL prompt in Connection Modal:\n%s", view)
+	}
+}
+
+func TestOverlayCenteredPreservesUnderlyingPanelEdges(t *testing.T) {
+	base := strings.Join([]string{
+		"┌──────────────────┐",
+		"│                  │",
+		"│                  │",
+		"└──────────────────┘",
+	}, "\n")
+	overlay := "╔════╗\n║ OK ║\n╚════╝"
+
+	view := overlayCentered(base, overlay, 20, 1)
+	lines := strings.Split(view, "\n")
+	for _, lineIndex := range []int{1, 2} {
+		if !strings.HasPrefix(lines[lineIndex], "│") || !strings.HasSuffix(lines[lineIndex], "│") {
+			t.Fatalf("expected overlay to preserve panel edges on line %d:\n%s", lineIndex, view)
+		}
+	}
+	if !strings.Contains(lines[1], "╔════╗") || !strings.Contains(lines[2], "║ OK ║") {
+		t.Fatalf("expected overlay content centered over base:\n%s", view)
+	}
+}
+
+func TestConnectionModalEndpointSelectionFitsAvailableHeight(t *testing.T) {
+	model := NewModel(Dependencies{})
+	for i := 0; i < 7; i++ {
+		model.endpoints = append(model.endpoints, opcua.Endpoint{
+			SecurityMode:     "SignAndEncrypt",
+			SecurityPolicy:   "Basic256Sha256",
+			UserTokenTypes:   []string{"Anonymous", "UserName", "Certificate"},
+			SecurityLevel:    uint8(100 + i),
+			ServerThumbprint: "B0448DB3ABFBE3CA1E1C60D97ED4D35A7E1A7704",
+		})
+	}
+	model.selectedEndpoint = 4
+
+	view := model.connectionModalView(120, 16)
+	lines := strings.Split(view, "\n")
+	if len(lines) > 16 {
+		t.Fatalf("expected endpoint selection modal to fit available height, got %d lines:\n%s", len(lines), view)
+	}
+	if !strings.Contains(view, "↓") && !strings.Contains(view, "↑") {
+		t.Fatalf("expected truncated endpoint list to show scroll affordance:\n%s", view)
+	}
+}
+
+func TestConnectionModalDiscoversEnteredEndpoint(t *testing.T) {
+	client := &fakeClient{endpoints: []opcua.Endpoint{{SecurityMode: "None", SecurityPolicy: "None", UserTokenTypes: []string{"Anonymous"}}}}
+	model := NewModel(Dependencies{Client: client})
+
+	updated := tea.Model(model)
+	for _, r := range "opc.tcp://localhost:4840" {
+		updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	updated, cmd := updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("expected endpoint discovery command")
+	}
+
+	msg := cmd()
+	if _, ok := msg.(endpointDiscoveryMsg); !ok {
+		t.Fatalf("expected endpointDiscoveryMsg, got %T", msg)
+	}
+	if client.discovered != "opc.tcp://localhost:4840" {
+		t.Fatalf("discovered endpoint = %q", client.discovered)
+	}
+}
+
+func TestConnectionModalConnectsEnteredEndpoint(t *testing.T) {
+	client := &fakeClient{}
+	model := NewModel(Dependencies{Client: client})
+	model.connectionInput.SetValue("opc.tcp://entered:4840")
+	model.connectionEndpoint = "opc.tcp://entered:4840"
+	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
+		SecurityMode:   "None",
+		SecurityPolicy: "None",
+		UserTokenTypes: []string{"Anonymous"},
+	}}})
+
+	_, cmd := updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("expected connect command")
+	}
+	msg := cmd()
+	if _, ok := msg.(endpointConnectionMsg); !ok {
+		t.Fatalf("expected endpointConnectionMsg, got %T", msg)
+	}
+	if client.connected.Endpoint != "opc.tcp://entered:4840" {
+		t.Fatalf("connected endpoint = %q", client.connected.Endpoint)
+	}
+}
+
+func TestConnectionModalCanDismissAndReopenWhenDisconnected(t *testing.T) {
+	model := NewModel(Dependencies{})
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	view := updated.(Model).View()
+	if strings.Contains(view, "Connect to OPC UA Server") {
+		t.Fatalf("expected Connection Modal to close on Esc:\n%s", view)
+	}
+	if !strings.Contains(view, "Open Connection Modal to connect") {
+		t.Fatalf("expected unconnected shell to explain how to connect:\n%s", view)
+	}
+
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	view = updated.(Model).View()
+	if !strings.Contains(view, "Connect to OPC UA Server") {
+		t.Fatalf("expected c to reopen Connection Modal when disconnected:\n%s", view)
+	}
+}
+
 func TestHelpToggle(t *testing.T) {
 	model := NewModel(Dependencies{})
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
@@ -108,6 +229,22 @@ func TestEndpointSelectionMovesAndConnects(t *testing.T) {
 	}
 	if client.connected.SecurityPolicy != "Basic256Sha256" || client.connected.SecurityMode != "Sign" {
 		t.Fatalf("connected request = %#v", client.connected)
+	}
+}
+
+func TestSuccessfulConnectionClosesConnectionModal(t *testing.T) {
+	model := NewModel(Dependencies{Client: &fakeClient{}})
+
+	updated, cmd := model.Update(endpointConnectionMsg{Request: opcua.ConnectRequest{SecurityMode: "None", SecurityPolicy: "None"}})
+	if cmd == nil {
+		t.Fatal("expected browse command after connection")
+	}
+	view := updated.(Model).View()
+	if strings.Contains(view, "Connect to OPC UA Server") {
+		t.Fatalf("expected Connection Modal to close after connection:\n%s", view)
+	}
+	if !strings.Contains(view, "Loading Objects Address Space") {
+		t.Fatalf("expected Address Space browsing after connection:\n%s", view)
 	}
 }
 
@@ -339,6 +476,7 @@ func TestSelectingNonVariableCancelsSelectedLiveValue(t *testing.T) {
 
 func TestWatchlistScrollsWhenFocused(t *testing.T) {
 	model := NewModel(Dependencies{})
+	model.connectionModalOpen = false
 	model.focus = focusWatchlist
 	for i := 0; i < 5; i++ {
 		model.inspections.Watch(opcua.AddressNode{NodeID: fmt.Sprintf("ns=2;s=Node%d", i), DisplayName: fmt.Sprintf("Node%d", i), NodeClass: "Variable"})
