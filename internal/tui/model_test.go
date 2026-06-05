@@ -13,6 +13,10 @@ import (
 	"termua/internal/opcua"
 )
 
+func markModelConnected(model *Model) {
+	model.connection.ApplyConnection(opcua.ConnectRequest{SecurityMode: "None", SecurityPolicy: "None", AuthType: opcua.AuthAnonymous}, nil)
+}
+
 func runCmds(cmd tea.Cmd) []tea.Msg {
 	if cmd == nil {
 		return nil
@@ -75,8 +79,9 @@ func TestOverlayCenteredPreservesUnderlyingPanelEdges(t *testing.T) {
 
 func TestConnectionModalEndpointSelectionFitsAvailableHeight(t *testing.T) {
 	model := NewModel(Dependencies{})
+	endpoints := make([]opcua.Endpoint, 0, 7)
 	for i := 0; i < 7; i++ {
-		model.endpoints = append(model.endpoints, opcua.Endpoint{
+		endpoints = append(endpoints, opcua.Endpoint{
 			SecurityMode:     "SignAndEncrypt",
 			SecurityPolicy:   "Basic256Sha256",
 			UserTokenTypes:   []string{"Anonymous", "UserName", "Certificate"},
@@ -84,7 +89,10 @@ func TestConnectionModalEndpointSelectionFitsAvailableHeight(t *testing.T) {
 			ServerThumbprint: "B0448DB3ABFBE3CA1E1C60D97ED4D35A7E1A7704",
 		})
 	}
-	model.selectedEndpoint = 4
+	model.connection.ApplyDiscovery(endpoints, nil)
+	for model.connection.View().SelectedEndpoint != 4 {
+		model.connection.MoveEndpointSelection(1)
+	}
 
 	view := model.connectionModalView(120, 16)
 	lines := strings.Split(view, "\n")
@@ -122,7 +130,7 @@ func TestConnectionModalConnectsEnteredEndpoint(t *testing.T) {
 	client := &fakeClient{}
 	model := NewModel(Dependencies{Client: client})
 	model.connectionInput.SetValue("opc.tcp://entered:4840")
-	model.connectionEndpoint = "opc.tcp://entered:4840"
+	model.connection.SetEndpointText("opc.tcp://entered:4840")
 	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
 		SecurityMode:   "None",
 		SecurityPolicy: "None",
@@ -200,14 +208,14 @@ func TestEndpointSelectionMovesAndConnects(t *testing.T) {
 	}})
 
 	selected := updated.(Model)
-	if selected.selectedEndpoint != 1 {
-		t.Fatalf("selected endpoint = %d", selected.selectedEndpoint)
+	if selected.connection.View().SelectedEndpoint != 1 {
+		t.Fatalf("selected endpoint = %d", selected.connection.View().SelectedEndpoint)
 	}
 
 	updated, _ = selected.Update(tea.KeyMsg{Type: tea.KeyDown})
 	selected = updated.(Model)
-	if selected.selectedEndpoint != 0 {
-		t.Fatalf("selected endpoint after down = %d", selected.selectedEndpoint)
+	if selected.connection.View().SelectedEndpoint != 0 {
+		t.Fatalf("selected endpoint after down = %d", selected.connection.View().SelectedEndpoint)
 	}
 
 	updated, cmd := selected.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -215,7 +223,7 @@ func TestEndpointSelectionMovesAndConnects(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("expected connect command")
 	}
-	if !selected.connecting {
+	if !selected.connection.View().Connecting {
 		t.Fatal("expected model to be connecting")
 	}
 
@@ -276,7 +284,7 @@ func TestConnectedEndpointBrowsesObjectsRoot(t *testing.T) {
 
 func TestAddressSpaceScrollsToSelectedNode(t *testing.T) {
 	model := NewModel(Dependencies{})
-	model.connected = true
+	markModelConnected(&model)
 	model.height = 18
 	model.addressSpace = &AddressSpace{tree: []treeNode{{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}, expanded: true, childrenLoaded: true}}}
 	for i := 1; i <= 20; i++ {
@@ -305,7 +313,7 @@ func TestExpandSelectedNodeBrowsesLazily(t *testing.T) {
 		"i=2253": {{NodeID: "i=2258", DisplayName: "ServerStatus", BrowseName: "ServerStatus", NodeClass: "Variable"}},
 	}}
 	model := NewModel(Dependencies{Client: client})
-	model.connected = true
+	markModelConnected(&model)
 	model.addressSpace = &AddressSpace{tree: []treeNode{
 		{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}, expanded: true, childrenLoaded: true},
 		{node: opcua.AddressNode{NodeID: "i=2253", DisplayName: "Server", NodeClass: "Object"}, depth: 1},
@@ -328,7 +336,7 @@ func TestWatchlistSubscribesSelectedVariableNode(t *testing.T) {
 	updates := make(chan opcua.LiveValue, 1)
 	client := &fakeClient{subscriptions: map[string]chan opcua.LiveValue{"ns=2;s=Temperature": updates}}
 	model := NewModel(Dependencies{Client: client})
-	model.connected = true
+	markModelConnected(&model)
 	model.addressSpace = &AddressSpace{tree: []treeNode{
 		{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}, expanded: true, childrenLoaded: true},
 		{node: opcua.AddressNode{NodeID: "ns=2;s=Temperature", DisplayName: "Temperature", NodeClass: "Variable"}, depth: 1},
@@ -370,7 +378,7 @@ func TestSelectedVariableNodeSubscribesLiveValueIntoDetails(t *testing.T) {
 	updates := make(chan opcua.LiveValue, 1)
 	client := &fakeClient{subscriptions: map[string]chan opcua.LiveValue{"ns=2;s=Pressure": updates}}
 	model := NewModel(Dependencies{Client: client})
-	model.connected = true
+	markModelConnected(&model)
 	model.addressSpace = &AddressSpace{tree: []treeNode{
 		{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}, expanded: true, childrenLoaded: true},
 		{node: opcua.AddressNode{NodeID: "ns=2;s=Pressure", DisplayName: "Pressure", NodeClass: "Variable"}, depth: 1},
@@ -419,7 +427,7 @@ func TestSelectedVariableNodeShowsMetadataAndOutOfRange(t *testing.T) {
 		}},
 	}
 	model := NewModel(Dependencies{Client: client})
-	model.connected = true
+	markModelConnected(&model)
 	model.addressSpace = &AddressSpace{tree: []treeNode{
 		{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}, expanded: true, childrenLoaded: true},
 		{node: opcua.AddressNode{NodeID: "ns=2;s=Level", DisplayName: "Level", NodeClass: "Variable"}, depth: 1},
@@ -453,7 +461,7 @@ func TestSelectedVariableNodeShowsMetadataAndOutOfRange(t *testing.T) {
 func TestSelectingNonVariableCancelsSelectedLiveValue(t *testing.T) {
 	sub := &fakeSubscription{}
 	model := NewModel(Dependencies{Client: &fakeClient{}})
-	model.connected = true
+	markModelConnected(&model)
 	model.addressSpace = &AddressSpace{tree: []treeNode{
 		{node: opcua.AddressNode{NodeID: "i=85", DisplayName: "Objects", NodeClass: "Object"}, expanded: true, childrenLoaded: true},
 	}}

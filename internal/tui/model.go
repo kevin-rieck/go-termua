@@ -77,13 +77,9 @@ type Model struct {
 	focus               focus
 	showHelp            bool
 	statusLine          string
-	endpoints           []opcua.Endpoint
-	selectedEndpoint    int
-	connecting          bool
-	connected           bool
+	connection          ServerConnection
 	connectionModalOpen bool
 	connectionInput     textinput.Model
-	connectionEndpoint  string
 	details             []string
 	addressSpace        *AddressSpace
 	selectedTree        int
@@ -125,9 +121,9 @@ func NewModel(deps Dependencies) Model {
 		focus:               focusTree,
 		statusLine:          status,
 		details:             details,
+		connection:          NewServerConnection(deps.Launch.Endpoint),
 		connectionModalOpen: true,
 		connectionInput:     connectionInput,
-		connectionEndpoint:  deps.Launch.Endpoint,
 		addressSpace:        NewAddressSpace(),
 		inspections:         session.NewInspectionSet(),
 	}
@@ -157,7 +153,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc":
 			m.showHelp = false
 		case "c":
-			if m.connected {
+			if m.connection.View().Connected {
 				m.statusLine = "Read-Only Mode · already connected"
 			} else {
 				m.connectionModalOpen = true
@@ -203,32 +199,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case endpointDiscoveryMsg:
 		if msg.Err != nil {
 			log.Printf("endpoint discovery failed: %v", msg.Err)
-			m.statusLine = "Read-Only Mode · endpoint discovery failed"
-			m.details = []string{"Endpoint discovery failed.", msg.Err.Error()}
-			return m, nil
+		} else {
+			log.Printf("endpoint discovery succeeded: endpoints=%d", len(msg.Endpoints))
 		}
-		log.Printf("endpoint discovery succeeded: endpoints=%d", len(msg.Endpoints))
-		m.endpoints = msg.Endpoints
-		m.selectedEndpoint = defaultEndpointSelection(msg.Endpoints)
-		m.connected = false
-		m.connecting = false
-		m.statusLine = fmt.Sprintf("Read-Only Mode · discovered %d endpoint(s)", len(msg.Endpoints))
-		m.details = endpointDetailLines(msg.Endpoints, m.selectedEndpoint)
+		m.connection.ApplyDiscovery(msg.Endpoints, msg.Err)
+		view := m.connection.View()
+		m.statusLine = connectionStatusLine(view)
+		m.details = connectionDetailLines(view)
+		if msg.Err != nil {
+			m.details = append(m.details, msg.Err.Error())
+		}
 	case endpointConnectionMsg:
-		m.connecting = false
+		m.connection.ApplyConnection(msg.Request, msg.Err)
+		view := m.connection.View()
 		if msg.Err != nil {
 			log.Printf("endpoint connection failed: %v", msg.Err)
-			m.connected = false
-			m.statusLine = "Read-Only Mode · connection failed"
-			m.details = append(selectedEndpointLines(m.endpoints, m.selectedEndpoint), "", "Connection failed.", msg.Err.Error())
+			m.statusLine = connectionStatusLine(view)
+			m.details = append(connectionDetailLines(view), "", "Connection failed.", msg.Err.Error())
 			return m, nil
 		}
 		log.Printf("endpoint connection succeeded: endpoint=%s securityPolicy=%s securityMode=%s authType=%s", msg.Request.Endpoint, msg.Request.SecurityPolicy, msg.Request.SecurityMode, msg.Request.AuthType)
-		m.connected = true
 		m.connectionModalOpen = false
 		m.focus = focusTree
-		m.statusLine = fmt.Sprintf("Read-Only Mode · connected · %s · %s", compactSecurityMode(msg.Request.SecurityMode), msg.Request.SecurityPolicy)
-		m.details = append(selectedEndpointLines(m.endpoints, m.selectedEndpoint), "", "Connected with Anonymous authentication.", "Loading Objects Address Space…")
+		m.statusLine = connectionStatusLine(view)
+		m.details = append(connectionDetailLines(view), "", "Connected with Anonymous authentication.", "Loading Objects Address Space…")
 		return m, m.startBrowse("i=85")
 	case browseChildrenMsg:
 		m.applyBrowseResult(msg)
@@ -303,10 +297,11 @@ func overlayCentered(base string, overlay string, width int, top int) string {
 }
 
 func (m Model) connectionModalActive() bool {
-	return m.connectionModalOpen && !m.connected
+	return m.connectionModalOpen && !m.connection.View().Connected
 }
 
 func (m Model) connectionModalView(width int, maxHeight int) string {
+	view := m.connection.View()
 	modalWidth := clamp(width/2, 48, 72)
 	style := modalStyle.Width(modalWidth)
 	contentWidth := modalWidth - style.GetHorizontalFrameSize()
@@ -317,19 +312,19 @@ func (m Model) connectionModalView(width int, maxHeight int) string {
 		labelStyle.Render("Server URL"),
 		ansi.Truncate(input.View(), contentWidth, "…"),
 	}
-	if len(m.endpoints) == 0 {
+	if len(view.Endpoints) == 0 {
 		lines = append(lines, mutedStyle.Render("Enter server URL"))
 	} else {
 		reservedFooterLines := 2
-		if m.connecting {
+		if view.Connecting {
 			reservedFooterLines += 2
 		}
 		contentHeight := maxHeight - style.GetVerticalFrameSize()
 		availableEndpointLines := contentHeight - len(lines) - 1 - reservedFooterLines
 		lines = append(lines, "")
-		lines = append(lines, endpointSelectionModalLines(m.endpoints, m.selectedEndpoint, availableEndpointLines, contentWidth)...)
+		lines = append(lines, endpointSelectionModalLines(view.Endpoints, view.SelectedEndpoint, availableEndpointLines, contentWidth)...)
 	}
-	if m.connecting {
+	if view.Connecting {
 		lines = append(lines, "", "Connecting with Anonymous authentication…")
 	}
 	lines = append(lines, "", footerStyle.Render(m.statusLine))
@@ -424,7 +419,7 @@ func (m Model) updateConnectionModal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.showHelp = !m.showHelp
 		return m, nil
 	case "esc":
-		if !m.connecting {
+		if !m.connection.View().Connecting {
 			m.connectionModalOpen = false
 			m.statusLine = "Read-Only Mode · not connected"
 		}
@@ -451,18 +446,17 @@ func (m Model) updateConnectionModal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	var cmd tea.Cmd
 	m.connectionInput, cmd = m.connectionInput.Update(msg)
-	m.connectionEndpoint = strings.TrimSpace(m.connectionInput.Value())
+	m.connection.SetEndpointText(m.connectionInput.Value())
 	return m, cmd
 }
 
 func (m *Model) discoverConnectionEndpoint() tea.Cmd {
-	m.connectionEndpoint = strings.TrimSpace(m.connectionInput.Value())
-	if m.connectionEndpoint == "" || m.client == nil {
-		m.statusLine = "Read-Only Mode · enter an OPC UA Server URL"
-		return nil
-	}
-	m.statusLine = "Read-Only Mode · discovering endpoints"
-	return discoverEndpointsCmd(m.client, m.connectionEndpoint)
+	m.connection.SetEndpointText(m.connectionInput.Value())
+	requests := m.connection.Submit()
+	view := m.connection.View()
+	m.statusLine = connectionStatusLine(view)
+	m.details = connectionDetailLines(view)
+	return m.commandsFromConnectionRequests(requests)
 }
 
 func (m Model) watchlistLines(panelHeight int) []string {
@@ -576,7 +570,7 @@ func (m Model) addressSpaceLines(panelHeight int) []string {
 		}
 		lines = append(lines, line)
 	}
-	if !m.connected {
+	if !m.connection.View().Connected {
 		lines = append(lines, mutedStyle.Render("  Open Connection Modal to connect"))
 	}
 	lines = append(lines, "", labelStyle.Render("Search")+": indexed Objects nodes")
@@ -601,7 +595,7 @@ func (m Model) footer(width int) string {
 	rightHint := "Tab focus · ? help · q quit"
 	if m.hasEndpointSelection() {
 		rightHint = "↑/↓ endpoint · Enter connect · ? help · q quit"
-	} else if m.focus == focusTree && m.connected {
+	} else if m.focus == focusTree && m.connection.View().Connected {
 		rightHint = "↑/↓ node · Enter expand · w watch · ← collapse · ? help · q quit"
 	} else if m.focus == focusWatchlist {
 		rightHint = "↑/↓ scroll Watchlist · Tab focus · ? help · q quit"
@@ -733,6 +727,29 @@ func cancelSubscriptionCmd(subscription opcua.ValueSubscription) tea.Cmd {
 	}
 }
 
+func (m Model) commandsFromConnectionRequests(requests []ServerConnectionRequest) tea.Cmd {
+	if len(requests) == 0 {
+		return nil
+	}
+	cmds := make([]tea.Cmd, 0, len(requests))
+	for _, request := range requests {
+		switch request.Kind {
+		case ServerConnectionRequestDiscoverEndpoints:
+			if m.client != nil {
+				cmds = append(cmds, discoverEndpointsCmd(m.client, request.Endpoint))
+			}
+		case ServerConnectionRequestConnectEndpoint:
+			if m.client != nil {
+				cmds = append(cmds, connectEndpointCmd(m.client, request.Connect))
+			}
+		}
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
+}
+
 func (m Model) commandsFromRequests(requests []session.Request) tea.Cmd {
 	if len(requests) == 0 {
 		return nil
@@ -782,7 +799,7 @@ func (m *Model) moveWatchSelection(delta int) {
 }
 
 func (m *Model) expandSelectedNode() tea.Cmd {
-	if !m.connected || m.client == nil {
+	if !m.connection.View().Connected || m.client == nil {
 		return nil
 	}
 	visible := m.addressSpace.View()
@@ -812,7 +829,7 @@ func (m *Model) collapseSelectedNode() {
 }
 
 func (m *Model) addSelectedNodeToWatchlist() tea.Cmd {
-	if !m.connected || m.client == nil {
+	if !m.connection.View().Connected || m.client == nil {
 		return nil
 	}
 	visible := m.addressSpace.View()
@@ -836,7 +853,7 @@ func (m *Model) addSelectedNodeToWatchlist() tea.Cmd {
 }
 
 func (m *Model) selectNode(node opcua.AddressNode) tea.Cmd {
-	if node.NodeClass != "Variable" || !m.connected || m.client == nil {
+	if node.NodeClass != "Variable" || !m.connection.View().Connected || m.client == nil {
 		m.details = nodeDetailLines(node)
 		return m.commandsFromRequests(m.inspections.Select(node))
 	}
@@ -996,7 +1013,7 @@ func (m Model) addressTreePageSize(panelHeight int) int {
 	if m.launch.Endpoint != "" {
 		fixedLines += 2
 	}
-	if !m.connected {
+	if !m.connection.View().Connected {
 		fixedLines++
 	}
 	pageSize := bodyLines - fixedLines
@@ -1117,46 +1134,74 @@ func compactAge(age time.Duration) string {
 }
 
 func (m *Model) moveEndpointSelection(delta int) {
-	if len(m.endpoints) == 0 {
-		return
-	}
-	m.selectedEndpoint = (m.selectedEndpoint + delta + len(m.endpoints)) % len(m.endpoints)
-	m.details = endpointDetailLines(m.endpoints, m.selectedEndpoint)
+	m.connection.MoveEndpointSelection(delta)
+	view := m.connection.View()
+	m.details = connectionDetailLines(view)
 }
 
 func (m Model) hasEndpointSelection() bool {
-	return len(m.endpoints) > 0 && !m.connecting && !m.connected
+	return m.connection.View().HasEndpointSelection
 }
 
 func (m *Model) connectSelectedEndpoint() tea.Cmd {
 	if !m.hasEndpointSelection() || m.client == nil {
 		return nil
 	}
-	serverURL := strings.TrimSpace(m.connectionEndpoint)
-	if serverURL == "" {
-		serverURL = strings.TrimSpace(m.launch.Endpoint)
-	}
-	if serverURL == "" {
-		return nil
-	}
+	requests := m.connection.Submit()
+	view := m.connection.View()
+	m.statusLine = connectionStatusLine(view)
+	m.details = connectionDetailLines(view)
+	return m.commandsFromConnectionRequests(requests)
+}
 
-	endpoint := m.endpoints[m.selectedEndpoint]
-	if !supportsAuth(endpoint, opcua.AuthAnonymous) {
-		m.statusLine = "Read-Only Mode · endpoint requires credentials"
-		m.details = append(selectedEndpointLines(m.endpoints, m.selectedEndpoint), "", "This endpoint does not advertise Anonymous authentication.", "Username/password selection is not implemented yet.")
-		return nil
+func connectionStatusLine(view ServerConnectionView) string {
+	switch view.Status {
+	case ServerConnectionNeedsEndpoint:
+		return "Read-Only Mode · enter an OPC UA Server URL"
+	case ServerConnectionDiscovering:
+		return "Read-Only Mode · discovering endpoints"
+	case ServerConnectionDiscoveryFailed:
+		return "Read-Only Mode · endpoint discovery failed"
+	case ServerConnectionDiscovered:
+		return fmt.Sprintf("Read-Only Mode · discovered %d endpoint(s)", len(view.Endpoints))
+	case ServerConnectionConnecting:
+		if view.SelectedEndpoint >= 0 && view.SelectedEndpoint < len(view.Endpoints) {
+			endpoint := view.Endpoints[view.SelectedEndpoint]
+			return fmt.Sprintf("Read-Only Mode · connecting · %s · %s", compactSecurityMode(endpoint.SecurityMode), endpoint.SecurityPolicy)
+		}
+		return "Read-Only Mode · connecting"
+	case ServerConnectionConnected:
+		if view.SelectedEndpoint >= 0 && view.SelectedEndpoint < len(view.Endpoints) {
+			endpoint := view.Endpoints[view.SelectedEndpoint]
+			return fmt.Sprintf("Read-Only Mode · connected · %s · %s", compactSecurityMode(endpoint.SecurityMode), endpoint.SecurityPolicy)
+		}
+		return "Read-Only Mode · connected"
+	case ServerConnectionFailed:
+		return "Read-Only Mode · connection failed"
+	case ServerConnectionEndpointRequiresCredentials:
+		return "Read-Only Mode · endpoint requires credentials"
+	default:
+		return "Read-Only Mode"
 	}
+}
 
-	request := opcua.ConnectRequest{
-		Endpoint:       serverURL,
-		SecurityPolicy: endpoint.SecurityPolicy,
-		SecurityMode:   endpoint.SecurityMode,
-		AuthType:       opcua.AuthAnonymous,
+func connectionDetailLines(view ServerConnectionView) []string {
+	switch view.Status {
+	case ServerConnectionNeedsEndpoint:
+		return []string{"Enter an OPC UA Server URL to discover advertised endpoints."}
+	case ServerConnectionDiscovering:
+		return []string{"Discovering OPC UA Server endpoints…"}
+	case ServerConnectionDiscoveryFailed:
+		return []string{"Endpoint discovery failed."}
+	case ServerConnectionEndpointRequiresCredentials:
+		return append(selectedEndpointLines(view.Endpoints, view.SelectedEndpoint), "", "This endpoint does not advertise Anonymous authentication.", "Username/password selection is not implemented yet.")
+	case ServerConnectionConnecting:
+		return append(selectedEndpointLines(view.Endpoints, view.SelectedEndpoint), "", "Connecting with Anonymous authentication…")
+	case ServerConnectionDiscovered, ServerConnectionConnected, ServerConnectionFailed:
+		return endpointDetailLines(view.Endpoints, view.SelectedEndpoint)
+	default:
+		return endpointDetailLines(view.Endpoints, view.SelectedEndpoint)
 	}
-	m.connecting = true
-	m.statusLine = fmt.Sprintf("Read-Only Mode · connecting · %s · %s", compactSecurityMode(endpoint.SecurityMode), endpoint.SecurityPolicy)
-	m.details = append(selectedEndpointLines(m.endpoints, m.selectedEndpoint), "", "Connecting with Anonymous authentication…")
-	return connectEndpointCmd(m.client, request)
 }
 
 func endpointDetailLines(endpoints []opcua.Endpoint, selected int) []string {
@@ -1200,29 +1245,6 @@ func selectedEndpointLines(endpoints []opcua.Endpoint, selected int) []string {
 		}
 	}
 	return lines
-}
-
-func defaultEndpointSelection(endpoints []opcua.Endpoint) int {
-	for i, endpoint := range endpoints {
-		if compactSecurityMode(endpoint.SecurityMode) == "None" && endpoint.SecurityPolicy == "None" && supportsAuth(endpoint, opcua.AuthAnonymous) {
-			return i
-		}
-	}
-	for i, endpoint := range endpoints {
-		if supportsAuth(endpoint, opcua.AuthAnonymous) {
-			return i
-		}
-	}
-	return 0
-}
-
-func supportsAuth(endpoint opcua.Endpoint, auth opcua.AuthType) bool {
-	for _, token := range endpoint.UserTokenTypes {
-		if strings.EqualFold(strings.TrimPrefix(strings.TrimSpace(token), "UserTokenType"), string(auth)) {
-			return true
-		}
-	}
-	return false
 }
 
 func compactSecurityMode(mode string) string {
