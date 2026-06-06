@@ -1,4 +1,4 @@
-module github.com/earendil-works/bubble-toast
+module bubble-toast
 
 go 1.22
 
