@@ -3,8 +3,8 @@ package toast_test
 import (
 	"testing"
 
-	"bubble-toast"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/kevin-rieck/go-bubble-toast"
 )
 
 func TestPublicAPIErgonomicsForBubbleTeaApps(t *testing.T) {

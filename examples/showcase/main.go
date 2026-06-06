@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"bubble-toast"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/kevin-rieck/go-bubble-toast"
 )
 
 type model struct {

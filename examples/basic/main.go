@@ -5,8 +5,8 @@ import (
 	"os"
 	"time"
 
-	"bubble-toast"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/kevin-rieck/go-bubble-toast"
 )
 
 type model struct {

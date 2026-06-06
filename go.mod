@@ -1,4 +1,4 @@
-module bubble-toast
+module github.com/kevin-rieck/go-bubble-toast
 
 go 1.22
 
