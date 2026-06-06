@@ -340,3 +340,23 @@ func ids(ts []Toast) []string {
 	}
 	return out
 }
+
+func TestResponsiveToWindowSize(t *testing.T) {
+	m := New(WithWidth(40), WithOverlayMargin(0, 2, 0, 3), WithStyle(KindNone, lipgloss.NewStyle().Border(lipgloss.NormalBorder())))
+	m, _, _ = m.Push(NewToast("this is a very long message that should wrap if the window is small enough"))
+
+	// Default width is 40
+	view := m.View()
+	if lipgloss.Width(view) != 40 {
+		t.Fatalf("expected width 40, got %d", lipgloss.Width(view))
+	}
+
+	// Resize window to 20
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 20, Height: 10})
+	view = m.View()
+
+	// Max available width = 20 - 3 (left) - 2 (right) = 15
+	if w := lipgloss.Width(view); w > 15 {
+		t.Fatalf("toast did not respond to viewport changes, expected max width 15, got %d", w)
+	}
+}

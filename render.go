@@ -94,13 +94,24 @@ func (m Model) renderEntries() []entry {
 func isTop(p Placement) bool { return p == TopLeft || p == TopRight || p == TopCenter }
 
 func (m Model) renderToast(t Toast, index, total int) string {
+	targetWidth := m.width
+	if m.winW > 0 {
+		maxAvailable := m.winW - m.margin.Left - m.margin.Right
+		if targetWidth > maxAvailable {
+			targetWidth = maxAvailable
+		}
+	}
+	if targetWidth < 1 {
+		targetWidth = 1
+	}
+
 	style := m.styleFor(t.Kind)
-	innerWidth := m.width - style.GetHorizontalFrameSize()
+	innerWidth := targetWidth - style.GetHorizontalFrameSize()
 	if innerWidth < 1 {
 		innerWidth = 1
 	}
 	style = style.Width(innerWidth)
-	ctx := RenderContext{Width: m.width, MaxHeight: m.maxHeight, Style: style, Placement: m.placement, Index: index, Total: total}
+	ctx := RenderContext{Width: targetWidth, MaxHeight: m.maxHeight, Style: style, Placement: m.placement, Index: index, Total: total}
 	if m.renderer != nil {
 		return m.renderer(t, ctx)
 	}
