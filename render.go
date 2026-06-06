@@ -219,15 +219,16 @@ func overlayAt(canvas []string, stack string, x, y int) string {
 }
 
 func replaceAt(base, over string, x int) string {
-	if x >= len(base) {
-		return base
-	}
 	if x < 0 {
 		x = 0
 	}
-	end := x + len(over)
-	if end > len(base) {
-		end = len(base)
+	if x >= len(base) {
+		return base + strings.Repeat(" ", x-len(base)) + over
 	}
-	return base[:x] + over[:end-x] + base[end:]
+	overWidth := lipgloss.Width(over)
+	suffixStart := x + overWidth
+	if suffixStart >= len(base) {
+		return base[:x] + over
+	}
+	return base[:x] + over + base[suffixStart:]
 }

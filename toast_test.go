@@ -166,6 +166,17 @@ func TestOverlayFallbackDoesNotClipToastWhenBaseIsNarrowerThanStack(t *testing.T
 	}
 }
 
+func TestOverlayDoesNotClipStyledToastRightEdge(t *testing.T) {
+	m := New(WithWidth(20), WithMaxHeight(0), WithOverlayMargin(1, 1, 1, 1))
+	m, _, _ = m.Push(NewToast("visible", WithID("styled")))
+
+	out := m.OverlayWithSize(strings.Repeat(".", 60), 60, 6)
+
+	if !strings.Contains(out, "╮") || !strings.Contains(out, "╯") {
+		t.Fatalf("overlay clipped styled Toast right edge: %q", out)
+	}
+}
+
 func TestExpirationRemovesCurrentGenerationAndDrainsQueue(t *testing.T) {
 	m := New(WithMaxVisible(1), WithDefaultDuration(time.Hour))
 	m, _, _ = m.Push(NewToast("one", WithID("one")))
