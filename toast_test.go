@@ -47,7 +47,7 @@ func TestQueueReplacementDismissalAndTimers(t *testing.T) {
 	if cmd == nil || m.Visible()[0].Message != "updated" {
 		t.Fatalf("visible replacement did not update and restart timer")
 	}
-	old := expirationMsg{id: "one", generation: m.visible[0].generation - 1}
+	old := expirationMsg{id: "one", generation: m.visible[0].generation - 1, epoch: m.epoch}
 	m, _ = m.Update(old)
 	if m.Visible()[0].ID != "one" {
 		t.Fatal("stale expiration dismissed replacement")
@@ -313,9 +313,23 @@ func TestExpirationRemovesCurrentGenerationAndDrainsQueue(t *testing.T) {
 	m, _, _ = m.Push(NewToast("one", WithID("one")))
 	gen := m.visible[0].generation
 	m, _, _ = m.Push(NewToast("two", WithID("two")))
-	m, cmd := m.Update(expirationMsg{id: "one", generation: gen})
+	m, cmd := m.Update(expirationMsg{id: "one", generation: gen, epoch: m.epoch})
 	if m.Visible()[0].ID != "two" || cmd == nil {
 		t.Fatalf("expiration did not drain queue and schedule timer")
+	}
+}
+
+func TestExpirationFromReplacedToastModelDoesNotDismissNewModelToast(t *testing.T) {
+	oldModel := New(WithDefaultDuration(time.Hour))
+	oldModel, _, _ = oldModel.Push(NewToast("old generated ID"))
+	stale := expirationMsg{id: oldModel.visible[0].toast.ID, generation: oldModel.visible[0].generation, epoch: oldModel.epoch}
+
+	newModel := New(WithDefaultDuration(time.Hour))
+	newModel, _, _ = newModel.Push(NewToast("new generated ID"))
+	newModel, _ = newModel.Update(stale)
+
+	if newModel.Len() != 1 || newModel.Visible()[0].Message != "new generated ID" {
+		t.Fatalf("old model expiration dismissed new model Toast: %#v", newModel.Visible())
 	}
 }
 

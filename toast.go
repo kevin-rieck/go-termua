@@ -1,6 +1,8 @@
 package toast
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -57,6 +59,7 @@ type DismissAllMsg struct{}
 type expirationMsg struct {
 	id         ID
 	generation uint64
+	epoch      uint64
 }
 
 type RenderContext struct {
@@ -101,6 +104,7 @@ type Model struct {
 	queued  []entry
 	nextID  uint64
 	nextGen uint64
+	epoch   uint64
 	winW    int
 	winH    int
 }
@@ -121,6 +125,7 @@ func New(options ...Option) Model {
 		theme:           DefaultTheme(),
 		nextID:          1,
 		nextGen:         1,
+		epoch:           newEpoch(),
 	}
 	for _, opt := range options {
 		opt(&m)
@@ -240,6 +245,9 @@ func (m Model) Queued() []Toast {
 func (m Model) Len() int { return len(m.visible) + len(m.queued) }
 
 func (m Model) expire(msg expirationMsg) (Model, tea.Cmd) {
+	if msg.epoch != m.epoch {
+		return m, nil
+	}
 	for _, e := range m.visible {
 		if e.toast.ID == msg.id && e.generation != msg.generation {
 			return m, nil
@@ -270,7 +278,8 @@ func (m Model) timer(e entry) tea.Cmd {
 	if d == 0 {
 		d = m.defaultDuration
 	}
-	return tea.Tick(d, func(time.Time) tea.Msg { return expirationMsg{id: e.toast.ID, generation: e.generation} })
+	epoch := m.epoch
+	return tea.Tick(d, func(time.Time) tea.Msg { return expirationMsg{id: e.toast.ID, generation: e.generation, epoch: epoch} })
 }
 
 func (m *Model) generateID() ID {
@@ -363,6 +372,14 @@ func WithKind(kind Kind) ToastOption           { return func(t *Toast) { t.Kind 
 func WithDuration(d time.Duration) ToastOption { return func(t *Toast) { t.Duration = d } }
 func WithPersistent() ToastOption              { return func(t *Toast) { t.Persistent = true } }
 func WithContent(content string) ToastOption   { return func(t *Toast) { t.Content = content } }
+
+func newEpoch() uint64 {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return binary.LittleEndian.Uint64(b[:])
+	}
+	return uint64(time.Now().UnixNano())
+}
 
 func strconv64(n uint64) string {
 	if n == 0 {
