@@ -34,6 +34,17 @@ func (m Model) Overlay(base string) string {
 	w, h := m.winW, m.winH
 	if w <= 0 || h <= 0 {
 		w, h = lipgloss.Width(base), lipgloss.Height(base)
+		stack := m.View()
+		if stack != "" {
+			minW := lipgloss.Width(stack) + m.margin.Left + m.margin.Right
+			minH := lipgloss.Height(stack) + m.margin.Top + m.margin.Bottom
+			if w < minW {
+				w = minW
+			}
+			if h < minH {
+				h = minH
+			}
+		}
 	}
 	return m.OverlayWithSize(base, w, h)
 }
@@ -82,7 +93,12 @@ func (m Model) renderEntries() []entry {
 func isTop(p Placement) bool { return p == TopLeft || p == TopRight || p == TopCenter }
 
 func (m Model) renderToast(t Toast, index, total int) string {
-	style := m.styleFor(t.Kind).Width(m.width)
+	style := m.styleFor(t.Kind)
+	innerWidth := m.width - style.GetHorizontalFrameSize()
+	if innerWidth < 1 {
+		innerWidth = 1
+	}
+	style = style.Width(innerWidth)
 	ctx := RenderContext{Width: m.width, MaxHeight: m.maxHeight, Style: style, Placement: m.placement, Index: index, Total: total}
 	if m.renderer != nil {
 		return m.renderer(t, ctx)
@@ -98,10 +114,6 @@ func (m Model) renderToast(t Toast, index, total int) string {
 			}
 			body += t.Message
 		}
-	}
-	innerWidth := m.width - style.GetHorizontalFrameSize()
-	if innerWidth < 1 {
-		innerWidth = 1
 	}
 	body = wrap(body, innerWidth)
 	rendered := style.Render(body)

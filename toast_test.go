@@ -155,6 +155,17 @@ func TestOverlayPlacementWithExplicitAndStoredDimensions(t *testing.T) {
 	}
 }
 
+func TestOverlayFallbackDoesNotClipToastWhenBaseIsNarrowerThanStack(t *testing.T) {
+	m := New(WithStyle(KindNone, lipgloss.NewStyle()), WithWidth(20), WithMaxHeight(0), WithOverlayMargin(1, 1, 1, 1))
+	m, _, _ = m.Push(NewToast("this should remain visible", WithID("wide")))
+
+	out := m.Overlay("short")
+
+	if !strings.Contains(out, "should remain") || !strings.Contains(out, "isible") {
+		t.Fatalf("fallback overlay clipped Toast to base width: %q", out)
+	}
+}
+
 func TestExpirationRemovesCurrentGenerationAndDrainsQueue(t *testing.T) {
 	m := New(WithMaxVisible(1), WithDefaultDuration(time.Hour))
 	m, _, _ = m.Push(NewToast("one", WithID("one")))
