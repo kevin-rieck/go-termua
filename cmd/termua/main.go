@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -38,8 +39,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	client := opcua.NewClient()
+	defer client.Close(context.Background())
+
 	model := tui.NewModel(tui.Dependencies{
-		Client: opcua.NewClient(),
+		Client: client,
 		Paths:  paths,
 		Launch: opts,
 	})

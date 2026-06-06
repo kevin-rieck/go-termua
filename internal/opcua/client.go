@@ -42,13 +42,15 @@ type Endpoint struct {
 }
 
 type ConnectRequest struct {
-	Endpoint       string
-	ConnectionName string
-	SecurityPolicy string
-	SecurityMode   string
-	AuthType       AuthType
-	Username       string
-	Password       string
+	Endpoint              string
+	ConnectionName        string
+	SecurityPolicy        string
+	SecurityMode          string
+	AuthType              AuthType
+	Username              string
+	Password              string
+	ClientCertificatePath string
+	ClientPrivateKeyPath  string
 }
 
 // AddressNode is the app-level projection of a browsed Address Space node.
@@ -121,6 +123,12 @@ func (c *gopcuaClient) DiscoverEndpoints(ctx context.Context, endpoint string) (
 
 func (c *gopcuaClient) Connect(ctx context.Context, request ConnectRequest) error {
 	log.Printf("opcua: Connect request endpoint=%s securityPolicy=%s securityMode=%s authType=%s", request.Endpoint, request.SecurityPolicy, request.SecurityMode, request.AuthType)
+	if request.AuthType != AuthAnonymous && request.AuthType != AuthUsername {
+		return fmt.Errorf("unsupported authentication mode: %s", request.AuthType)
+	}
+	if compactMessageSecurityMode(request.SecurityMode) != "None" && (request.ClientCertificatePath == "" || request.ClientPrivateKeyPath == "") {
+		return fmt.Errorf("secure endpoint requires client certificate and private key")
+	}
 	securityMode := ua.MessageSecurityModeFromString(request.SecurityMode)
 	endpoints, err := gopcua.GetEndpoints(ctx, request.Endpoint)
 	if err != nil {
@@ -138,23 +146,7 @@ func (c *gopcuaClient) Connect(ctx context.Context, request ConnectRequest) erro
 	// the endpoint the Automation Engineer supplied.
 	ep.EndpointURL = request.Endpoint
 
-	authType := ua.UserTokenTypeAnonymous
-	opts := []gopcua.Option{
-		gopcua.ApplicationName("TermUA"),
-		gopcua.ProductURI("urn:termua"),
-		gopcua.SecurityFromEndpoint(ep, authType),
-		gopcua.AuthAnonymous(),
-	}
-
-	if request.AuthType == AuthUsername {
-		authType = ua.UserTokenTypeUserName
-		opts = []gopcua.Option{
-			gopcua.ApplicationName("TermUA"),
-			gopcua.ProductURI("urn:termua"),
-			gopcua.SecurityFromEndpoint(ep, authType),
-			gopcua.AuthUsername(request.Username, request.Password),
-		}
-	}
+	opts := clientOptionsForConnectRequest(ep, request)
 
 	client, err := gopcua.NewClient(ep.EndpointURL, opts...)
 	if err != nil {
@@ -512,6 +504,39 @@ func rangeValue(value any) *ValueRange {
 	default:
 		return nil
 	}
+}
+
+func clientOptionsForConnectRequest(ep *ua.EndpointDescription, request ConnectRequest) []gopcua.Option {
+	authType := ua.UserTokenTypeAnonymous
+	authOption := gopcua.AuthAnonymous()
+	if request.AuthType == AuthUsername {
+		authType = ua.UserTokenTypeUserName
+		authOption = gopcua.AuthUsername(request.Username, request.Password)
+	}
+
+	opts := []gopcua.Option{
+		gopcua.ApplicationName("TermUA"),
+		gopcua.ProductURI("urn:termua"),
+	}
+	if compactMessageSecurityMode(request.SecurityMode) != "None" {
+		opts = append(opts,
+			gopcua.CertificateFile(request.ClientCertificatePath),
+			gopcua.PrivateKeyFile(request.ClientPrivateKeyPath),
+		)
+	}
+	opts = append(opts,
+		gopcua.SecurityFromEndpoint(ep, authType),
+		authOption,
+	)
+	return opts
+}
+
+func compactMessageSecurityMode(mode string) string {
+	mode = strings.TrimPrefix(strings.TrimSpace(mode), "MessageSecurityMode")
+	if mode == "" {
+		return "Unknown"
+	}
+	return mode
 }
 
 func endpointFromDescription(ep *ua.EndpointDescription) Endpoint {

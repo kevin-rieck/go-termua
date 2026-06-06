@@ -8,6 +8,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/ansi v0.11.6
 	github.com/gopcua/opcua v0.8.0
+	github.com/kevin-rieck/go-bubble-toast v0.1.0
 )
 
 require (

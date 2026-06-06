@@ -3,10 +3,14 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	toast "github.com/kevin-rieck/go-bubble-toast"
 
 	"termua/internal/app"
 	"termua/internal/config"
@@ -193,16 +197,7 @@ func TestOverlayCenteredPreservesUnderlyingPanelEdges(t *testing.T) {
 
 func TestConnectionModalEndpointSelectionFitsAvailableHeight(t *testing.T) {
 	model := NewModel(Dependencies{})
-	endpoints := make([]opcua.Endpoint, 0, 7)
-	for i := 0; i < 7; i++ {
-		endpoints = append(endpoints, opcua.Endpoint{
-			SecurityMode:     "SignAndEncrypt",
-			SecurityPolicy:   "Basic256Sha256",
-			UserTokenTypes:   []string{"Anonymous", "UserName", "Certificate"},
-			SecurityLevel:    uint8(100 + i),
-			ServerThumbprint: "B0448DB3ABFBE3CA1E1C60D97ED4D35A7E1A7704",
-		})
-	}
+	endpoints := longSecureEndpointList()
 	model.connection.ApplyDiscovery(endpoints, nil)
 	for model.connection.View().SelectedEndpoint != 4 {
 		model.connection.MoveEndpointSelection(1)
@@ -216,6 +211,43 @@ func TestConnectionModalEndpointSelectionFitsAvailableHeight(t *testing.T) {
 	if !strings.Contains(view, "↓") && !strings.Contains(view, "↑") {
 		t.Fatalf("expected truncated endpoint list to show scroll affordance:\n%s", view)
 	}
+}
+
+func TestConnectionModalEndpointSelectionWithErrorFitsAvailableHeight(t *testing.T) {
+	model := NewModel(Dependencies{Launch: app.LaunchOptions{Endpoint: "opc.tcp://localhost:4840"}})
+	endpoints := longSecureEndpointList()
+	for i := range endpoints {
+		endpoints[i].UserTokenTypes = []string{"Anonymous"}
+	}
+	model.connection.ApplyDiscovery(endpoints, nil)
+	for model.connection.View().SelectedEndpoint != 4 {
+		model.connection.MoveEndpointSelection(1)
+	}
+	model.connection.Submit()
+	model.connection.SelectAuthType(0)
+
+	view := model.connectionModalView(120, 16)
+	lines := strings.Split(view, "\n")
+	if len(lines) > 16 {
+		t.Fatalf("expected endpoint selection modal with error to fit available height, got %d lines:\n%s", len(lines), view)
+	}
+	if strings.Contains(view, "secure endpoint requires client certificate") || strings.Contains(view, "Error:") {
+		t.Fatalf("expected connection error to be omitted from modal body:\n%s", view)
+	}
+}
+
+func longSecureEndpointList() []opcua.Endpoint {
+	endpoints := make([]opcua.Endpoint, 0, 7)
+	for i := 0; i < 7; i++ {
+		endpoints = append(endpoints, opcua.Endpoint{
+			SecurityMode:     "SignAndEncrypt",
+			SecurityPolicy:   "Basic256Sha256",
+			UserTokenTypes:   []string{"Anonymous", "UserName", "Certificate"},
+			SecurityLevel:    uint8(100 + i),
+			ServerThumbprint: "B0448DB3ABFBE3CA1E1C60D97ED4D35A7E1A7704",
+		})
+	}
+	return endpoints
 }
 
 func TestConnectionModalDiscoversEnteredEndpoint(t *testing.T) {
@@ -293,7 +325,140 @@ func TestHelpToggle(t *testing.T) {
 	}
 }
 
-func TestEndpointDiscoveryUpdatesDetails(t *testing.T) {
+func TestSnapshotExportDoesNotCreateEmptySnapshot(t *testing.T) {
+	exportDir := t.TempDir()
+	model := NewModel(Dependencies{Paths: config.Paths{CacheDir: exportDir}})
+	model.connectionModalOpen = false
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	view := updated.(Model).View()
+	if !strings.Contains(view, "no watched Variable Nodes to export") {
+		t.Fatalf("expected empty Watchlist export status:\n%s", view)
+	}
+	visibleToasts := updated.(Model).toasts.Visible()
+	if len(visibleToasts) != 1 || visibleToasts[0].Kind != toast.KindError || !strings.Contains(visibleToasts[0].Message, "no watched Variable Nodes") {
+		t.Fatalf("expected error toast for empty Snapshot export, got %#v", visibleToasts)
+	}
+	files, err := filepath.Glob(filepath.Join(exportDir, "exports", "snapshot-*.md"))
+	if err != nil || len(files) != 0 {
+		t.Fatalf("expected no Snapshot files, files=%#v err=%v", files, err)
+	}
+}
+
+func TestSnapshotExportWritesCurrentWatchlist(t *testing.T) {
+	exportDir := t.TempDir()
+	model := NewModel(Dependencies{Paths: config.Paths{CacheDir: exportDir}})
+	updated, _ := model.Update(endpointConnectionMsg{Request: opcua.ConnectRequest{Endpoint: "opc.tcp://server:4840", SecurityMode: "None", SecurityPolicy: "None", AuthType: opcua.AuthUsername, Username: "engineer", Password: "secret-password"}})
+	model = updated.(Model)
+	model.connectionModalOpen = false
+	model.inspections.Watch(opcua.AddressNode{NodeID: "ns=2;s=Temperature", DisplayName: "Temperature", NodeClass: "Variable"})
+	model.inspections.ApplyDetails("ns=2;s=Temperature", opcua.NodeDetails{NodeID: "ns=2;s=Temperature", EURange: &opcua.ValueRange{Low: 0, High: 100}}, nil)
+	model.inspections.ApplyLiveValue("ns=2;s=Temperature", opcua.LiveValue{
+		NodeID:          "ns=2;s=Temperature",
+		Value:           "120",
+		Status:          "StatusOK",
+		SourceTimestamp: time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC),
+		ServerTimestamp: time.Date(2026, 6, 6, 12, 0, 1, 0, time.UTC),
+	}, nil)
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	view := updated.(Model).View()
+	if !strings.Contains(view, "Snapshot exported") {
+		t.Fatalf("expected successful Snapshot export status:\n%s", view)
+	}
+	visibleToasts := updated.(Model).toasts.Visible()
+	if !hasToast(visibleToasts, toast.KindSuccess, "snapshot-") {
+		t.Fatalf("expected success toast for Snapshot export, got %#v", visibleToasts)
+	}
+
+	files, err := filepath.Glob(filepath.Join(exportDir, "exports", "snapshot-*.md"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("expected one Snapshot file, files=%#v err=%v", files, err)
+	}
+	contentBytes, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(contentBytes)
+	for _, expected := range []string{"# Watchlist Snapshot", "node names, process values, endpoints, and server metadata may be sensitive", "opc.tcp://server:4840", "None", "UserName", "Temperature", "ns=2;s=Temperature", "120", "StatusOK", "2026-06-06T12:00:00Z", "2026-06-06T12:00:01Z", "Out-of-Range: 120 is above 100"} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("expected %q in Snapshot:\n%s", expected, content)
+		}
+	}
+	if strings.Contains(content, "secret-password") {
+		t.Fatalf("Snapshot leaked password:\n%s", content)
+	}
+}
+
+func hasToast(toasts []toast.Toast, kind toast.Kind, messageFragment string) bool {
+	for _, item := range toasts {
+		if item.Kind == kind && strings.Contains(item.Message, messageFragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestEndpointDiscoveryLabelsUsernamePasswordRequirement(t *testing.T) {
+	model := NewModel(Dependencies{})
+	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
+		SecurityMode:   "None",
+		SecurityPolicy: "None",
+		UserTokenTypes: []string{"UserName"},
+	}}})
+	view := updated.(Model).View()
+
+	if !strings.Contains(view, "username/password") {
+		t.Fatalf("expected username/password capability label:\n%s", view)
+	}
+}
+
+func TestEndpointDiscoveryLabelsSecureEndpointConnectableWhenCertificateConfigured(t *testing.T) {
+	model := NewModel(Dependencies{Launch: app.LaunchOptions{ClientCertificatePath: "cert.pem", ClientPrivateKeyPath: "key.pem"}})
+	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
+		SecurityMode:   "Sign",
+		SecurityPolicy: "Basic256Sha256",
+		UserTokenTypes: []string{"Anonymous"},
+	}}})
+	view := updated.(Model).View()
+
+	if !strings.Contains(view, "connectable") {
+		t.Fatalf("expected connectable capability label:\n%s", view)
+	}
+	if strings.Contains(view, "cert/key") {
+		t.Fatalf("did not expect cert/key requirement when configured:\n%s", view)
+	}
+}
+
+func TestEndpointDiscoveryLabelsSecureEndpointCertificateRequirement(t *testing.T) {
+	model := NewModel(Dependencies{})
+	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
+		SecurityMode:   "Sign",
+		SecurityPolicy: "Basic256Sha256",
+		UserTokenTypes: []string{"Anonymous"},
+	}}})
+	view := updated.(Model).View()
+
+	if !strings.Contains(view, "cert/key") {
+		t.Fatalf("expected client cert/key capability label:\n%s", view)
+	}
+}
+
+func TestEndpointDiscoveryLabelsUnsupportedAuthentication(t *testing.T) {
+	model := NewModel(Dependencies{})
+	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
+		SecurityMode:   "None",
+		SecurityPolicy: "None",
+		UserTokenTypes: []string{"Certificate"},
+	}}})
+	view := updated.(Model).View()
+
+	if !strings.Contains(view, "unsupported auth") {
+		t.Fatalf("expected unsupported auth capability label:\n%s", view)
+	}
+}
+
+func TestEndpointDiscoveryDoesNotReplaceNodeDetails(t *testing.T) {
 	model := NewModel(Dependencies{})
 	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
 		SecurityMode:   "None",
@@ -301,12 +466,16 @@ func TestEndpointDiscoveryUpdatesDetails(t *testing.T) {
 		UserTokenTypes: []string{"Anonymous"},
 	}}})
 	view := updated.(Model).View()
+	details := strings.Join(updated.(Model).details, "\n")
 
 	if !strings.Contains(view, "discovered 1 endpoint") {
 		t.Fatalf("expected discovery status:\n%s", view)
 	}
 	if !strings.Contains(view, "None · None · Anonymous") {
-		t.Fatalf("expected endpoint details:\n%s", view)
+		t.Fatalf("expected endpoint selection in connection modal:\n%s", view)
+	}
+	if strings.Contains(details, "endpoint") || strings.Contains(details, "Endpoint") {
+		t.Fatalf("expected Node Details to stay node-only, got:\n%s", details)
 	}
 	if !strings.Contains(view, "Enter connect") {
 		t.Fatalf("expected endpoint selection footer:\n%s", view)
@@ -315,7 +484,7 @@ func TestEndpointDiscoveryUpdatesDetails(t *testing.T) {
 
 func TestEndpointSelectionMovesAndConnects(t *testing.T) {
 	client := &fakeClient{}
-	model := NewModel(Dependencies{Client: client, Launch: app.LaunchOptions{Endpoint: "opc.tcp://localhost:4840"}})
+	model := NewModel(Dependencies{Client: client, Launch: app.LaunchOptions{Endpoint: "opc.tcp://localhost:4840", ClientCertificatePath: "cert.pem", ClientPrivateKeyPath: "key.pem"}})
 	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{
 		{SecurityMode: "Sign", SecurityPolicy: "Basic256Sha256", UserTokenTypes: []string{"Anonymous"}},
 		{SecurityMode: "None", SecurityPolicy: "None", UserTokenTypes: []string{"Anonymous"}},
@@ -352,6 +521,9 @@ func TestEndpointSelectionMovesAndConnects(t *testing.T) {
 	if client.connected.SecurityPolicy != "Basic256Sha256" || client.connected.SecurityMode != "Sign" {
 		t.Fatalf("connected request = %#v", client.connected)
 	}
+	if client.connected.ClientCertificatePath != "cert.pem" || client.connected.ClientPrivateKeyPath != "key.pem" {
+		t.Fatalf("cert/key paths = %q / %q", client.connected.ClientCertificatePath, client.connected.ClientPrivateKeyPath)
+	}
 }
 
 func TestSuccessfulConnectionClosesConnectionModal(t *testing.T) {
@@ -366,7 +538,7 @@ func TestSuccessfulConnectionClosesConnectionModal(t *testing.T) {
 		t.Fatalf("expected Connection Modal to close after connection:\n%s", view)
 	}
 	if !strings.Contains(view, "Loading Objects Address Space") {
-		t.Fatalf("expected Address Space browsing after connection:\n%s", view)
+		t.Fatalf("expected Address Space browsing status after connection:\n%s", view)
 	}
 }
 
@@ -380,10 +552,17 @@ func TestConnectedEndpointBrowsesObjectsRoot(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("expected browse command")
 	}
-	msg := cmd()
-	browse, ok := msg.(browseChildrenMsg)
-	if !ok {
-		t.Fatalf("expected browseChildrenMsg, got %T", msg)
+	var browse browseChildrenMsg
+	foundBrowse := false
+	for _, msg := range runCmds(cmd) {
+		if candidate, ok := msg.(browseChildrenMsg); ok {
+			browse = candidate
+			foundBrowse = true
+			break
+		}
+	}
+	if !foundBrowse {
+		t.Fatalf("expected browseChildrenMsg")
 	}
 	if browse.ParentNodeID != "i=85" {
 		t.Fatalf("browsed node = %q", browse.ParentNodeID)
@@ -685,4 +864,326 @@ type fakeSubscription struct {
 func (f *fakeSubscription) Cancel(ctx context.Context) error {
 	f.cancelled = true
 	return nil
+}
+
+func TestWizardShowsAuthTypeSelectionForMultiAuthEndpoint(t *testing.T) {
+	client := &fakeClient{}
+	model := NewModel(Dependencies{Client: client})
+	model.connectionInput.SetValue("opc.tcp://localhost:4840")
+	model.connection.SetEndpointText("opc.tcp://localhost:4840")
+	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
+		SecurityMode:   "None",
+		SecurityPolicy: "None",
+		UserTokenTypes: []string{"Anonymous", "UserName"},
+	}}})
+
+	// Press Enter to select the endpoint
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	view := updated.(Model).View()
+
+	if !strings.Contains(view, "Authentication") {
+		t.Fatalf("expected auth selection step in view:\n%s", view)
+	}
+	if !strings.Contains(view, "Anonymous") || !strings.Contains(view, "UserName") {
+		t.Fatalf("expected auth options in view:\n%s", view)
+	}
+}
+
+func TestWizardConnectsAnonymouslyThroughFullFlow(t *testing.T) {
+	client := &fakeClient{}
+	model := NewModel(Dependencies{Client: client})
+	model.connectionInput.SetValue("opc.tcp://localhost:4840")
+	model.connection.SetEndpointText("opc.tcp://localhost:4840")
+	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
+		SecurityMode:   "None",
+		SecurityPolicy: "None",
+		UserTokenTypes: []string{"Anonymous", "UserName"},
+	}}})
+
+	// Select endpoint → auth selection
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	// Select Anonymous (index 0) → connect
+	_, cmd := updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("expected connect command after selecting Anonymous")
+	}
+	msg := cmd()
+	if _, ok := msg.(endpointConnectionMsg); !ok {
+		t.Fatalf("expected endpointConnectionMsg, got %T", msg)
+	}
+	if client.connected.AuthType != opcua.AuthAnonymous {
+		t.Fatalf("auth type = %v, expected Anonymous", client.connected.AuthType)
+	}
+}
+
+func TestWizardShowsCredentialFormForUserNameAuth(t *testing.T) {
+	client := &fakeClient{}
+	model := NewModel(Dependencies{Client: client})
+	model.connectionInput.SetValue("opc.tcp://localhost:4840")
+	model.connection.SetEndpointText("opc.tcp://localhost:4840")
+	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
+		SecurityMode:   "None",
+		SecurityPolicy: "None",
+		UserTokenTypes: []string{"Anonymous", "UserName"},
+	}}})
+
+	// Select endpoint → auth selection
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	// Move down to UserName
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyDown})
+	// Select UserName → credential form
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	view := updated.(Model).View()
+
+	if !strings.Contains(view, "Username") {
+		t.Fatalf("expected credential form in view:\n%s", view)
+	}
+}
+
+func TestWizardRejectsUnsupportedCertificateAuth(t *testing.T) {
+	client := &fakeClient{}
+	model := NewModel(Dependencies{Client: client})
+	model.connectionInput.SetValue("opc.tcp://localhost:4840")
+	model.connection.SetEndpointText("opc.tcp://localhost:4840")
+	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
+		SecurityMode:   "None",
+		SecurityPolicy: "None",
+		UserTokenTypes: []string{"Anonymous", "Certificate"},
+	}}})
+
+	// Select endpoint → auth selection
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	// Move to Certificate, select it
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyDown})
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	view := updated.(Model).View()
+	if !strings.Contains(view, "unsupported authentication") || !strings.Contains(view, "Certificate") {
+		t.Fatalf("expected unsupported auth error in view:\n%s", view)
+	}
+	if !strings.Contains(view, "Authentication Options") {
+		t.Fatalf("expected auth options to remain visible after unsupported auth:\n%s", view)
+	}
+	state := updated.(Model).connection.View()
+	if !state.HasAuthTypeSelection {
+		t.Fatalf("expected auth selection to remain active after unsupported auth, view=%#v", state)
+	}
+
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyUp})
+	state = updated.(Model).connection.View()
+	if state.SelectedAuthType != 0 {
+		t.Fatalf("selected auth type = %d, expected arrow key to move back to Anonymous", state.SelectedAuthType)
+	}
+}
+
+func TestWizardConnectsWithCredentialsForUserNameOnlyEndpoint(t *testing.T) {
+	client := &fakeClient{}
+	model := NewModel(Dependencies{Client: client})
+	model.connectionInput.SetValue("opc.tcp://localhost:4840")
+	model.connection.SetEndpointText("opc.tcp://localhost:4840")
+	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
+		SecurityMode:   "None",
+		SecurityPolicy: "None",
+		UserTokenTypes: []string{"UserName"},
+	}}})
+
+	// Select username-only endpoint → credential form
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if !strings.Contains(updated.(Model).View(), "Username") {
+		t.Fatalf("expected credential form in view:\n%s", updated.(Model).View())
+	}
+
+	for _, r := range "operator" {
+		updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyTab})
+	for _, r := range "secret" {
+		updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+
+	_, cmd := updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("expected connect command after submitting credentials")
+	}
+	msg := cmd()
+	if _, ok := msg.(endpointConnectionMsg); !ok {
+		t.Fatalf("expected endpointConnectionMsg, got %T", msg)
+	}
+	if client.connected.AuthType != opcua.AuthUsername {
+		t.Fatalf("auth type = %v, expected UserName", client.connected.AuthType)
+	}
+	if client.connected.Username != "operator" || client.connected.Password != "secret" {
+		t.Fatalf("credentials = %q / %q", client.connected.Username, client.connected.Password)
+	}
+}
+
+func TestWizardConnectsWithCredentialsThroughFullFlow(t *testing.T) {
+	client := &fakeClient{}
+	model := NewModel(Dependencies{Client: client})
+	model.connectionInput.SetValue("opc.tcp://localhost:4840")
+	model.connection.SetEndpointText("opc.tcp://localhost:4840")
+	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
+		SecurityMode:   "None",
+		SecurityPolicy: "None",
+		UserTokenTypes: []string{"Anonymous", "UserName"},
+	}}})
+
+	// Select endpoint → auth selection
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	// Move to UserName, select it
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyDown})
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	// Type username
+	for _, r := range "admin" {
+		updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	// Tab to password
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyTab})
+	// Type password
+	for _, r := range "secret" {
+		updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	// Submit credentials
+	_, cmd := updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("expected connect command after submitting credentials")
+	}
+	msg := cmd()
+	if _, ok := msg.(endpointConnectionMsg); !ok {
+		t.Fatalf("expected endpointConnectionMsg, got %T", msg)
+	}
+	if client.connected.AuthType != opcua.AuthUsername {
+		t.Fatalf("auth type = %v, expected UserName", client.connected.AuthType)
+	}
+	if client.connected.Username != "admin" || client.connected.Password != "secret" {
+		t.Fatalf("credentials = %q / %q", client.connected.Username, client.connected.Password)
+	}
+}
+
+func TestWizardEscapeFromAuthSelectionGoesBackToEndpoints(t *testing.T) {
+	model := NewModel(Dependencies{})
+	model.connectionInput.SetValue("opc.tcp://localhost:4840")
+	model.connection.SetEndpointText("opc.tcp://localhost:4840")
+	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
+		SecurityMode:   "None",
+		SecurityPolicy: "None",
+		UserTokenTypes: []string{"Anonymous", "UserName"},
+	}}})
+
+	// Select endpoint → auth selection
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	// Escape should go back to endpoint list, not close the modal
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEsc})
+	view := updated.(Model).View()
+
+	if !strings.Contains(view, "Connect to OPC UA Server") {
+		t.Fatalf("expected wizard to stay open after Esc from auth step:\n%s", view)
+	}
+	if !strings.Contains(view, "None · None") {
+		t.Fatalf("expected endpoint list after going back:\n%s", view)
+	}
+}
+
+func TestWizardConnectionErrorDisplaysInView(t *testing.T) {
+	client := &fakeClient{}
+	model := NewModel(Dependencies{Client: client})
+	model.connectionInput.SetValue("opc.tcp://localhost:4840")
+	model.connection.SetEndpointText("opc.tcp://localhost:4840")
+	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
+		SecurityMode:   "None",
+		SecurityPolicy: "None",
+		UserTokenTypes: []string{"Anonymous"},
+	}}})
+
+	// Connect directly (single auth)
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	// Simulate connection error
+	updated, _ = updated.(Model).Update(endpointConnectionMsg{
+		Request: opcua.ConnectRequest{Endpoint: "opc.tcp://localhost:4840"},
+		Err:     fmt.Errorf("BadSecurityChecksFailed"),
+	})
+	view := updated.(Model).View()
+
+	if !strings.Contains(view, "BadSecurityChecksFailed") {
+		t.Fatalf("expected connection error in view:\n%s", view)
+	}
+}
+
+func TestWizardConnectionErrorFromAuthSelectionKeepsEndpointArrowsUsable(t *testing.T) {
+	client := &fakeClient{}
+	model := NewModel(Dependencies{Client: client})
+	model.connectionInput.SetValue("opc.tcp://localhost:4840")
+	model.connection.SetEndpointText("opc.tcp://localhost:4840")
+	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{
+		{SecurityMode: "None", SecurityPolicy: "None", UserTokenTypes: []string{"Anonymous", "UserName"}},
+		{SecurityMode: "Sign", SecurityPolicy: "Basic256Sha256", UserTokenTypes: []string{"Anonymous"}},
+	}})
+
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter}) // endpoint → auth selection
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter}) // Anonymous → connecting
+	updated, _ = updated.(Model).Update(endpointConnectionMsg{
+		Request: opcua.ConnectRequest{Endpoint: "opc.tcp://localhost:4840"},
+		Err:     fmt.Errorf("BadSecurityChecksFailed"),
+	})
+	failed := updated.(Model).connection.View()
+	if failed.HasAuthTypeSelection {
+		t.Fatalf("expected failed connection to leave auth selection, view=%#v", failed)
+	}
+
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyDown})
+	selected := updated.(Model).connection.View().SelectedEndpoint
+	if selected != 1 {
+		t.Fatalf("selected endpoint = %d, expected arrow key to move endpoint selection after failure", selected)
+	}
+}
+
+func TestWizardEndpointWithNoAuthDoesNotFreezeEndpointSelection(t *testing.T) {
+	client := &fakeClient{}
+	model := NewModel(Dependencies{Client: client})
+	model.connectionInput.SetValue("opc.tcp://localhost:4840")
+	model.connection.SetEndpointText("opc.tcp://localhost:4840")
+	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{
+		{SecurityMode: "None", SecurityPolicy: "None", UserTokenTypes: nil},
+		{SecurityMode: "None", SecurityPolicy: "None", UserTokenTypes: []string{"Anonymous"}},
+	}})
+
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyUp})
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	state := updated.(Model).connection.View()
+	if !state.HasEndpointSelection {
+		t.Fatalf("expected endpoint selection to remain available after no-auth endpoint error, view=%#v", state)
+	}
+
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyDown})
+	selected := updated.(Model).connection.View().SelectedEndpoint
+	if selected != 1 {
+		t.Fatalf("selected endpoint = %d, expected arrow key to move after no-auth endpoint error", selected)
+	}
+}
+
+func TestWizardConnectionErrorDoesNotReplaceNodeDetails(t *testing.T) {
+	client := &fakeClient{}
+	model := NewModel(Dependencies{Client: client})
+	model.connectionInput.SetValue("opc.tcp://localhost:4840")
+	model.connection.SetEndpointText("opc.tcp://localhost:4840")
+	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
+		SecurityMode:   "None",
+		SecurityPolicy: "None",
+		UserTokenTypes: []string{"Anonymous"},
+	}}})
+
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ = updated.(Model).Update(endpointConnectionMsg{
+		Request: opcua.ConnectRequest{Endpoint: "opc.tcp://localhost:4840"},
+		Err:     fmt.Errorf("BadSecurityChecksFailed"),
+	})
+
+	details := strings.Join(updated.(Model).details, "\n")
+	if strings.Contains(details, "Discovered endpoints") || strings.Contains(details, "Connection failed") || strings.Contains(details, "BadSecurityChecksFailed") {
+		t.Fatalf("expected Node Details to stay node-only after connection error, got:\n%s", details)
+	}
+	if !strings.Contains(details, "Select a Variable Node") {
+		t.Fatalf("expected default node details, got:\n%s", details)
+	}
 }
