@@ -40,18 +40,6 @@ m, id, cmd := m.Push(toast.Success("saved"))
 _, _ = id, cmd
 ```
 
-## Visual verification
+## Release
 
-VHS tapes run in Docker and write generated files under ignored `artifacts/`:
-
-```sh
-make -f Makefile.tapes capture-tapes
-```
-
-To create the feature showcase GIF only:
-
-```sh
-make -f Makefile.tapes capture-showcase
-```
-
-The showcase writes `artifacts/showcase.gif` and companion screenshots for each feature stage.
+See [CHANGELOG.md](CHANGELOG.md) for release notes.

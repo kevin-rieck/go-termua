@@ -1,2 +1,10 @@
 # Generated binaries and VHS visual outputs
 artifacts/
+
+# Local visual verification tooling
+Makefile.tapes
+tapes/
+
+# Local/internal planning notes (not part of the user-facing module release)
+CONTEXT.md
+docs/
