@@ -1,8 +1,9 @@
-.PHONY: capture-binary capture-startup capture-burst capture-tapes
+.PHONY: capture-binary capture-startup capture-burst capture-showcase capture-tapes
 
 capture-binary:
 	mkdir -p artifacts
 	GOOS=linux GOARCH=amd64 go build -o artifacts/bubble-toast-basic-linux ./examples/basic
+	GOOS=linux GOARCH=amd64 go build -o artifacts/bubble-toast-showcase-linux ./examples/showcase
 
 capture-startup: capture-binary
 	MSYS_NO_PATHCONV=1 docker run --rm -v "$(PWD):/vhs" -w /vhs ghcr.io/charmbracelet/vhs tapes/startup.tape
@@ -10,4 +11,7 @@ capture-startup: capture-binary
 capture-burst: capture-binary
 	MSYS_NO_PATHCONV=1 docker run --rm -v "$(PWD):/vhs" -w /vhs ghcr.io/charmbracelet/vhs tapes/burst.tape
 
-capture-tapes: capture-startup capture-burst
+capture-showcase: capture-binary
+	MSYS_NO_PATHCONV=1 docker run --rm -v "$(PWD):/vhs" -w /vhs ghcr.io/charmbracelet/vhs tapes/showcase.tape
+
+capture-tapes: capture-startup capture-burst capture-showcase

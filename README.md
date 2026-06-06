@@ -47,3 +47,11 @@ VHS tapes run in Docker and write generated files under ignored `artifacts/`:
 ```sh
 make -f Makefile.tapes capture-tapes
 ```
+
+To create the feature showcase GIF only:
+
+```sh
+make -f Makefile.tapes capture-showcase
+```
+
+The showcase writes `artifacts/showcase.gif` and companion screenshots for each feature stage.
