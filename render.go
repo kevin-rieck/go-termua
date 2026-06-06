@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func DefaultTheme() Theme {
@@ -154,22 +155,10 @@ func setStyle(t *Theme, kind Kind, style lipgloss.Style) {
 }
 
 func wrap(s string, width int) string {
-	var out []string
-	for _, line := range strings.Split(s, "\n") {
-		for lipgloss.Width(line) > width {
-			cut := width
-			for cut > 0 && lipgloss.Width(line[:cut]) > width {
-				cut--
-			}
-			if cut <= 0 {
-				cut = 1
-			}
-			out = append(out, line[:cut])
-			line = line[cut:]
-		}
-		out = append(out, line)
+	if width <= 0 {
+		return s
 	}
-	return strings.Join(out, "\n")
+	return ansi.GraphemeWidth.Wrap(s, width, " ")
 }
 
 func truncateHeight(s string, max int) string {
@@ -179,11 +168,13 @@ func truncateHeight(s string, max int) string {
 	}
 	lines = lines[:max]
 	last := lines[max-1]
-	w := lipgloss.Width(last)
-	if w == 0 {
+	width := lipgloss.Width(last)
+	if width <= 0 {
 		lines[max-1] = "…"
-	} else if len(last) > 0 {
-		lines[max-1] = last[:len(last)-1] + "…"
+	} else if width == 1 {
+		lines[max-1] = "…"
+	} else {
+		lines[max-1] = ansi.GraphemeWidth.Truncate(last, width-1, "") + "…"
 	}
 	return strings.Join(lines, "\n")
 }
@@ -222,13 +213,12 @@ func replaceAt(base, over string, x int) string {
 	if x < 0 {
 		x = 0
 	}
-	if x >= len(base) {
-		return base + strings.Repeat(" ", x-len(base)) + over
+	baseWidth := lipgloss.Width(base)
+	if x >= baseWidth {
+		return base + strings.Repeat(" ", x-baseWidth) + over
 	}
 	overWidth := lipgloss.Width(over)
-	suffixStart := x + overWidth
-	if suffixStart >= len(base) {
-		return base[:x] + over
-	}
-	return base[:x] + over + base[suffixStart:]
+	prefix := ansi.GraphemeWidth.Cut(base, 0, x)
+	suffix := ansi.GraphemeWidth.Cut(base, x+overWidth, baseWidth)
+	return prefix + over + suffix
 }

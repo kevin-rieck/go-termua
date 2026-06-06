@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -94,6 +95,47 @@ func TestPersistentAndQueueLimits(t *testing.T) {
 	}
 }
 
+func TestMatchingToastIDUpdateBypassesFullQueueCapacity(t *testing.T) {
+	m := New(WithMaxVisible(1), WithMaxQueued(1))
+	m, _, _ = m.Push(NewToast("visible", WithID("visible")))
+	m, _, _ = m.Push(NewToast("queued", WithID("queued")))
+
+	m, _, _ = m.Push(NewToast("queued replacement", WithID("queued")))
+
+	if got := m.Queued(); len(got) != 1 || got[0].Message != "queued replacement" {
+		t.Fatalf("matching Toast ID update should replace queued Toast even when queue is full: %#v", got)
+	}
+}
+
+func TestQueuedReturnsCopyInFIFOOrderAndLenCountsVisiblePlusQueued(t *testing.T) {
+	m := New(WithMaxVisible(1), WithMaxQueued(2))
+	m, _, _ = m.Push(NewToast("visible", WithID("visible")))
+	m, _, _ = m.Push(NewToast("first queued", WithID("first")))
+	m, _, _ = m.Push(NewToast("second queued", WithID("second")))
+
+	queued := m.Queued()
+	if got := strings.Join(ids(queued), ","); got != "first,second" {
+		t.Fatalf("Queued should be FIFO, got %s", got)
+	}
+	queued[0].Message = "mutated"
+	if m.Queued()[0].Message == "mutated" {
+		t.Fatal("Queued must return a copy")
+	}
+	if m.Len() != 3 {
+		t.Fatalf("Len should count visible plus queued, got %d", m.Len())
+	}
+}
+
+func TestDefaultVisibleStackLimitIsThree(t *testing.T) {
+	m := New()
+	for _, id := range []string{"1", "2", "3", "4"} {
+		m, _, _ = m.Push(NewToast("Toast "+id, WithID(id)))
+	}
+	if len(m.Visible()) != 3 || len(m.Queued()) != 1 {
+		t.Fatalf("default Toast Stack limit should show 3 and queue overflow, visible=%d queued=%d", len(m.Visible()), len(m.Queued()))
+	}
+}
+
 func TestRenderOrderCopiesPrecedenceWrappingTruncationAndOptions(t *testing.T) {
 	m := New(WithMaxVisible(3), WithPlacement(TopRight), WithWidth(10), WithMaxHeight(3), WithGap(0))
 	m, _, _ = m.Push(NewToast("old", WithID("old")))
@@ -132,6 +174,61 @@ func TestRenderOrderCopiesPrecedenceWrappingTruncationAndOptions(t *testing.T) {
 	m = New(WithMaxVisible(0), WithMaxQueued(-1), WithWidth(0), WithMaxHeight(-1), WithGap(-1))
 	if m.maxVisible != defaultMaxVisible || m.maxQueued != defaultMaxQueued || m.width != defaultWidth || m.maxHeight != defaultMaxHeight || m.gap != defaultGap {
 		t.Fatal("invalid options not normalized")
+	}
+}
+
+func TestCustomRendererReceivesLayoutContext(t *testing.T) {
+	var contexts []RenderContext
+	m := New(WithPlacement(BottomCenter), WithWidth(22), WithMaxHeight(7), WithMaxVisible(2), WithRenderer(func(t Toast, c RenderContext) string {
+		contexts = append(contexts, c)
+		return t.Message
+	}))
+	m, _, _ = m.Push(NewToast("first", WithID("first")))
+	m, _, _ = m.Push(NewToast("second", WithID("second")))
+
+	if view := m.View(); view != "first\n\nsecond" {
+		t.Fatalf("custom renderer should define full Toast presentation, got %q", view)
+	}
+	if len(contexts) != 2 {
+		t.Fatalf("expected context for each Toast, got %d", len(contexts))
+	}
+	for i, ctx := range contexts {
+		if ctx.Width != 22 || ctx.MaxHeight != 7 || ctx.Placement != BottomCenter || ctx.Index != i || ctx.Total != 2 {
+			t.Fatalf("unexpected render context at index %d: %#v", i, ctx)
+		}
+	}
+}
+
+func TestAllToastPlacementsOverlayStackInExpectedRegion(t *testing.T) {
+	base := strings.Join([]string{
+		"....................",
+		"....................",
+		"....................",
+		"....................",
+		"....................",
+	}, "\n")
+	cases := []struct {
+		name      string
+		placement Placement
+		wantRow   int
+		wantCol   int
+	}{
+		{"top left", TopLeft, 1, 1},
+		{"top right", TopRight, 1, 15},
+		{"top center", TopCenter, 1, 8},
+		{"bottom left", BottomLeft, 3, 1},
+		{"bottom right", BottomRight, 3, 15},
+		{"bottom center", BottomCenter, 3, 8},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := New(WithPlacement(tc.placement), WithOverlayMargin(1, 1, 1, 1), WithStyle(KindNone, lipgloss.NewStyle()), WithWidth(4), WithMaxHeight(0))
+			m, _, _ = m.Push(NewToast("T", WithID("toast")))
+			lines := strings.Split(m.OverlayWithSize(base, 20, 5), "\n")
+			if !strings.HasPrefix(lines[tc.wantRow][tc.wantCol:], "T") {
+				t.Fatalf("Toast not at expected region row=%d col=%d output=%q", tc.wantRow, tc.wantCol, strings.Join(lines, "\n"))
+			}
+		})
 	}
 }
 
@@ -174,6 +271,40 @@ func TestOverlayDoesNotClipStyledToastRightEdge(t *testing.T) {
 
 	if !strings.Contains(out, "╮") || !strings.Contains(out, "╯") {
 		t.Fatalf("overlay clipped styled Toast right edge: %q", out)
+	}
+}
+
+func TestRenderingWrapsWideAndStyledContentWithoutBreakingANSIOrWidth(t *testing.T) {
+	message := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render("コンニチハ世界 hello")
+	m := New(WithWidth(12), WithMaxHeight(0), WithStyle(KindNone, lipgloss.NewStyle()))
+	m, _, _ = m.Push(NewToast(message, WithID("wide-styled")))
+
+	for _, line := range strings.Split(m.View(), "\n") {
+		if strings.Contains(line, "�") {
+			t.Fatalf("rendering broke UTF-8: %q", m.View())
+		}
+		if lipgloss.Width(line) > 12 {
+			t.Fatalf("rendered line exceeds configured width: width=%d line=%q view=%q", lipgloss.Width(line), line, m.View())
+		}
+	}
+}
+
+func TestMaxHeightTruncatesStyledWideContentWithEllipsisWithoutBreakingUTF8(t *testing.T) {
+	message := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render("first\n世界\nthird")
+	m := New(WithWidth(10), WithMaxHeight(2), WithStyle(KindNone, lipgloss.NewStyle()))
+	m, _, _ = m.Push(NewToast(message, WithID("truncated")))
+
+	view := m.View()
+	if lipgloss.Height(view) != 2 {
+		t.Fatalf("View should be truncated to max height, height=%d view=%q", lipgloss.Height(view), view)
+	}
+	if !strings.Contains(view, "…") || !utf8.ValidString(view) {
+		t.Fatalf("truncated view should contain ellipsis without broken UTF-8: %q", view)
+	}
+	for _, line := range strings.Split(view, "\n") {
+		if lipgloss.Width(line) > 10 {
+			t.Fatalf("truncated line exceeds configured width: width=%d line=%q view=%q", lipgloss.Width(line), line, view)
+		}
 	}
 }
 
