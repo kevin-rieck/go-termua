@@ -341,6 +341,25 @@ func ids(ts []Toast) []string {
 	return out
 }
 
+func TestMaxHeightPreservesBordersWhenTruncating(t *testing.T) {
+	style := lipgloss.NewStyle().Border(lipgloss.NormalBorder())
+	m := New(WithWidth(20), WithMaxHeight(4), WithStyle(KindNone, style))
+	m, _, _ = m.Push(NewToast("line1\nline2\nline3\nline4\nline5"))
+
+	view := m.View()
+	lines := strings.Split(view, "\n")
+
+	if len(lines) != 4 {
+		t.Fatalf("expected exactly 4 lines, got %d", len(lines))
+	}
+	if !strings.Contains(lines[3], "╯") && !strings.Contains(lines[3], "┘") && !strings.Contains(lines[3], "─") {
+		t.Fatalf("expected intact bottom border on last line, got %q", lines[3])
+	}
+	if !strings.Contains(lines[2], "…") {
+		t.Fatalf("expected ellipsis on the last inner line, got %q", lines[2])
+	}
+}
+
 func TestResponsiveToWindowSize(t *testing.T) {
 	m := New(WithWidth(40), WithOverlayMargin(0, 2, 0, 3), WithStyle(KindNone, lipgloss.NewStyle().Border(lipgloss.NormalBorder())))
 	m, _, _ = m.Push(NewToast("this is a very long message that should wrap if the window is small enough"))

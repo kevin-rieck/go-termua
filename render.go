@@ -128,6 +128,14 @@ func (m Model) renderToast(t Toast, index, total int) string {
 		}
 	}
 	body = wrap(body, innerWidth)
+
+	if m.maxHeight > 0 {
+		maxInnerHeight := m.maxHeight - style.GetVerticalFrameSize()
+		if maxInnerHeight > 0 && lipgloss.Height(body) > maxInnerHeight {
+			body = truncateHeight(body, maxInnerHeight)
+		}
+	}
+
 	rendered := style.Render(body)
 	if m.maxHeight > 0 && lipgloss.Height(rendered) > m.maxHeight {
 		rendered = truncateHeight(rendered, m.maxHeight)
