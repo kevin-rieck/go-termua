@@ -152,7 +152,7 @@ func NewModel(deps Dependencies) Model {
 		addressSpace:        NewAddressSpace(),
 		inspections:         session.NewInspectionSet(),
 		rightPane:           rightPaneDetails,
-		toasts:              toast.New(toast.WithPlacement(toast.TopRight), toast.WithWidth(48), toast.WithMaxVisible(3), toast.WithMaxHeight(6)),
+		toasts:              toast.New(toast.WithPlacement(toast.TopRight), toast.WithWidth(48), toast.WithMaxVisible(3), toast.WithMaxHeight(6), toast.WithProgress(true)),
 	}
 }
 
