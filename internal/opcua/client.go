@@ -2,10 +2,15 @@ package opcua
 
 import (
 	"context"
+	"crypto/rsa"
 	"crypto/sha1"
+	"crypto/x509"
 	"encoding/hex"
+	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -91,8 +96,9 @@ type NodeDetails struct {
 type AuthType string
 
 const (
-	AuthAnonymous AuthType = "Anonymous"
-	AuthUsername  AuthType = "UserName"
+	AuthAnonymous   AuthType = "Anonymous"
+	AuthUsername    AuthType = "UserName"
+	AuthCertificate AuthType = "Certificate"
 )
 
 // NewClient returns the production OPC UA client service.
@@ -123,11 +129,16 @@ func (c *gopcuaClient) DiscoverEndpoints(ctx context.Context, endpoint string) (
 
 func (c *gopcuaClient) Connect(ctx context.Context, request ConnectRequest) error {
 	log.Printf("opcua: Connect request endpoint=%s securityPolicy=%s securityMode=%s authType=%s", request.Endpoint, request.SecurityPolicy, request.SecurityMode, request.AuthType)
-	if request.AuthType != AuthAnonymous && request.AuthType != AuthUsername {
+	if request.AuthType != AuthAnonymous && request.AuthType != AuthUsername && request.AuthType != AuthCertificate {
 		return fmt.Errorf("unsupported authentication mode: %s", request.AuthType)
 	}
-	if compactMessageSecurityMode(request.SecurityMode) != "None" && (request.ClientCertificatePath == "" || request.ClientPrivateKeyPath == "") {
-		return fmt.Errorf("secure endpoint requires client certificate and private key")
+	if connectRequestRequiresCertificateFiles(request) {
+		if request.ClientCertificatePath == "" || request.ClientPrivateKeyPath == "" {
+			return fmt.Errorf("certificate connection requires client certificate and private key")
+		}
+		if err := validateSecureEndpointCertificateFiles(request.ClientCertificatePath, request.ClientPrivateKeyPath); err != nil {
+			return err
+		}
 	}
 	securityMode := ua.MessageSecurityModeFromString(request.SecurityMode)
 	endpoints, err := gopcua.GetEndpoints(ctx, request.Endpoint)
@@ -155,7 +166,7 @@ func (c *gopcuaClient) Connect(ctx context.Context, request ConnectRequest) erro
 	}
 	if err := client.Connect(ctx); err != nil {
 		log.Printf("opcua: Connect failed endpointURL=%s error=%v", ep.EndpointURL, err)
-		return err
+		return secureConnectError(request, err)
 	}
 	log.Printf("opcua: Connect succeeded endpointURL=%s", ep.EndpointURL)
 
@@ -508,10 +519,16 @@ func rangeValue(value any) *ValueRange {
 
 func clientOptionsForConnectRequest(ep *ua.EndpointDescription, request ConnectRequest) []gopcua.Option {
 	authType := ua.UserTokenTypeAnonymous
-	authOption := gopcua.AuthAnonymous()
-	if request.AuthType == AuthUsername {
+	authOptions := []gopcua.Option{gopcua.AuthAnonymous()}
+	switch request.AuthType {
+	case AuthUsername:
 		authType = ua.UserTokenTypeUserName
-		authOption = gopcua.AuthUsername(request.Username, request.Password)
+		authOptions = []gopcua.Option{gopcua.AuthUsername(request.Username, request.Password)}
+	case AuthCertificate:
+		authType = ua.UserTokenTypeCertificate
+		cert, _ := loadCertificateDER(request.ClientCertificatePath)
+		key, _ := loadPrivateKey(request.ClientPrivateKeyPath)
+		authOptions = []gopcua.Option{gopcua.AuthCertificate(cert), gopcua.AuthPrivateKey(key)}
 	}
 
 	opts := []gopcua.Option{
@@ -524,11 +541,13 @@ func clientOptionsForConnectRequest(ep *ua.EndpointDescription, request ConnectR
 			gopcua.PrivateKeyFile(request.ClientPrivateKeyPath),
 		)
 	}
-	opts = append(opts,
-		gopcua.SecurityFromEndpoint(ep, authType),
-		authOption,
-	)
+	opts = append(opts, gopcua.SecurityFromEndpoint(ep, authType))
+	opts = append(opts, authOptions...)
 	return opts
+}
+
+func connectRequestRequiresCertificateFiles(request ConnectRequest) bool {
+	return compactMessageSecurityMode(request.SecurityMode) != "None" || request.AuthType == AuthCertificate
 }
 
 func compactMessageSecurityMode(mode string) string {
@@ -537,6 +556,112 @@ func compactMessageSecurityMode(mode string) string {
 		return "Unknown"
 	}
 	return mode
+}
+
+func secureConnectError(request ConnectRequest, err error) error {
+	if request.AuthType == AuthCertificate && errorsIndicateCertificateAuthRejected(err) {
+		return fmt.Errorf("certificate authentication rejected by server; trust the TermUA client certificate as a user certificate in the OPC UA Server and retry: %s", request.ClientCertificatePath)
+	}
+	if compactMessageSecurityMode(request.SecurityMode) == "None" {
+		return err
+	}
+	if errorsIsEOF(err) {
+		return fmt.Errorf("secure channel closed by server; trust the TermUA client application certificate in the OPC UA Server and retry: %s", request.ClientCertificatePath)
+	}
+	return err
+}
+
+func errorsIndicateCertificateAuthRejected(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "identitytoken") || strings.Contains(text, "identity token") || strings.Contains(text, "certificate")
+}
+
+func errorsIsEOF(err error) bool {
+	return err == io.EOF || strings.TrimSpace(err.Error()) == "EOF"
+}
+
+func validateSecureEndpointCertificateFiles(certificatePath, privateKeyPath string) error {
+	if err := validateCertificateFile(certificatePath); err != nil {
+		return err
+	}
+	if err := validatePrivateKeyFile(privateKeyPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateCertificateFile(path string) error {
+	if _, err := loadCertificateDER(path); err != nil {
+		return err
+	}
+	return nil
+}
+
+func loadCertificateDER(path string) ([]byte, error) {
+	data, err := readRegularFile("client certificate file", path)
+	if err != nil {
+		return nil, err
+	}
+	der := data
+	if strings.HasSuffix(path, ".pem") {
+		block, _ := pem.Decode(data)
+		if block == nil || block.Type != "CERTIFICATE" {
+			return nil, fmt.Errorf("client certificate file is not a PEM certificate: %s", path)
+		}
+		der = block.Bytes
+	}
+	if _, err := x509.ParseCertificate(der); err != nil {
+		return nil, fmt.Errorf("client certificate file is invalid: %s: %w", path, err)
+	}
+	return der, nil
+}
+
+func validatePrivateKeyFile(path string) error {
+	if _, err := loadPrivateKey(path); err != nil {
+		return err
+	}
+	return nil
+}
+
+func loadPrivateKey(path string) (*rsa.PrivateKey, error) {
+	data, err := readRegularFile("client private key file", path)
+	if err != nil {
+		return nil, err
+	}
+	der := data
+	if strings.HasSuffix(path, ".pem") {
+		block, _ := pem.Decode(data)
+		if block == nil || block.Type != "RSA PRIVATE KEY" {
+			return nil, fmt.Errorf("client private key file is not a PEM RSA private key: %s", path)
+		}
+		der = block.Bytes
+	}
+	key, err := x509.ParsePKCS1PrivateKey(der)
+	if err != nil {
+		return nil, fmt.Errorf("client private key file is invalid: %s: %w", path, err)
+	}
+	return key, nil
+}
+
+func readRegularFile(label, path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%s not found: %s", label, path)
+		}
+		return nil, fmt.Errorf("%s cannot be accessed: %s: %w", label, path, err)
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("%s is a directory: %s", label, path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("%s cannot be read: %s: %w", label, path, err)
+	}
+	return data, nil
 }
 
 func endpointFromDescription(ep *ua.EndpointDescription) Endpoint {

@@ -38,6 +38,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	if opts.ClientCertificatePath == "" && opts.ClientPrivateKeyPath == "" {
+		certificatePath, privateKeyPath, err := config.EnsureClientCertificate(paths)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		opts.ClientCertificatePath = certificatePath
+		opts.ClientPrivateKeyPath = privateKeyPath
+	}
 
 	client := opcua.NewClient()
 	defer client.Close(context.Background())

@@ -60,6 +60,49 @@ func TestConnectionModalOpensOnStartupWithoutEndpoint(t *testing.T) {
 	}
 }
 
+func TestOpenCertificateFolderUsesConfiguredCertificateDirectory(t *testing.T) {
+	opened := ""
+	model := NewModel(Dependencies{
+		Launch: app.LaunchOptions{ClientCertificatePath: filepath.Join("certs", "client-cert.pem")},
+		OpenFolder: func(path string) error {
+			opened = path
+			return nil
+		},
+	})
+
+	cmd := model.openCertificateFolder()
+	messages := runCmds(cmd)
+
+	if opened != "certs" {
+		t.Fatalf("opened folder = %q", opened)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("expected open certificate folder message, got %#v", messages)
+	}
+	msg, ok := messages[0].(openCertificateFolderMsg)
+	if !ok || msg.Path != "certs" || msg.Err != nil {
+		t.Fatalf("unexpected message: %#v", messages[0])
+	}
+}
+
+func TestOpenCertificateFolderFallsBackToGeneratedCertificateDirectory(t *testing.T) {
+	opened := ""
+	model := NewModel(Dependencies{
+		Paths: config.Paths{ConfigDir: "config"},
+		OpenFolder: func(path string) error {
+			opened = path
+			return nil
+		},
+	})
+
+	_ = runCmds(model.openCertificateFolder())
+
+	expected := filepath.Join("config", "certificates")
+	if opened != expected {
+		t.Fatalf("opened folder = %q, want %q", opened, expected)
+	}
+}
+
 func TestWatchlistIsRightPaneTabInsteadOfBottomPanel(t *testing.T) {
 	model := NewModel(Dependencies{})
 	model.connectionModalOpen = false
@@ -399,6 +442,30 @@ func hasToast(toasts []toast.Toast, kind toast.Kind, messageFragment string) boo
 	return false
 }
 
+func TestConnectionFailureShowsSecureChannelTrustHintToast(t *testing.T) {
+	model := NewModel(Dependencies{})
+	request := opcua.ConnectRequest{
+		Endpoint:              "opc.tcp://localhost:48010",
+		SecurityMode:          "SignAndEncrypt",
+		SecurityPolicy:        "Basic256Sha256",
+		AuthType:              opcua.AuthAnonymous,
+		ClientCertificatePath: "certificates/client-cert.pem",
+	}
+
+	updated, _ := model.Update(endpointConnectionMsg{
+		Request: request,
+		Err:     fmt.Errorf("secure channel closed by server; trust the TermUA client application certificate in the OPC UA Server and retry: certificates/client-cert.pem"),
+	})
+
+	visibleToasts := updated.(Model).toasts.Visible()
+	if !hasToast(visibleToasts, toast.KindInfo, "Trust the TermUA client application certificate") {
+		t.Fatalf("expected secure channel trust hint toast, got %#v", visibleToasts)
+	}
+	if !hasToast(visibleToasts, toast.KindInfo, "certificates/client-cert.pem") {
+		t.Fatalf("expected secure channel trust hint to include certificate path, got %#v", visibleToasts)
+	}
+}
+
 func TestEndpointDiscoveryLabelsUsernamePasswordRequirement(t *testing.T) {
 	model := NewModel(Dependencies{})
 	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
@@ -449,7 +516,7 @@ func TestEndpointDiscoveryLabelsUnsupportedAuthentication(t *testing.T) {
 	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
 		SecurityMode:   "None",
 		SecurityPolicy: "None",
-		UserTokenTypes: []string{"Certificate"},
+		UserTokenTypes: []string{"IssuedToken"},
 	}}})
 	view := updated.(Model).View()
 
@@ -940,7 +1007,7 @@ func TestWizardShowsCredentialFormForUserNameAuth(t *testing.T) {
 	}
 }
 
-func TestWizardRejectsUnsupportedCertificateAuth(t *testing.T) {
+func TestWizardRejectsUnsupportedIssuedTokenAuth(t *testing.T) {
 	client := &fakeClient{}
 	model := NewModel(Dependencies{Client: client})
 	model.connectionInput.SetValue("opc.tcp://localhost:4840")
@@ -948,17 +1015,17 @@ func TestWizardRejectsUnsupportedCertificateAuth(t *testing.T) {
 	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
 		SecurityMode:   "None",
 		SecurityPolicy: "None",
-		UserTokenTypes: []string{"Anonymous", "Certificate"},
+		UserTokenTypes: []string{"Anonymous", "IssuedToken"},
 	}}})
 
 	// Select endpoint → auth selection
 	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
-	// Move to Certificate, select it
+	// Move to IssuedToken, select it
 	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyDown})
 	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
 
 	view := updated.(Model).View()
-	if !strings.Contains(view, "unsupported authentication") || !strings.Contains(view, "Certificate") {
+	if !strings.Contains(view, "unsupported authentication") || !strings.Contains(view, "IssuedToken") {
 		t.Fatalf("expected unsupported auth error in view:\n%s", view)
 	}
 	if !strings.Contains(view, "Authentication Options") {

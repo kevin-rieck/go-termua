@@ -7,17 +7,17 @@ Review of the Server Connection flow found that the OPC UA Client TUI discovers 
 Supported today:
 
 - Message security: `None` with `SecurityPolicy=None`
+- Message security: `Sign`
+- Message security: `SignAndEncrypt`
 - Authentication: `Anonymous`
-- Authentication: `UserName` in the backend, with an incomplete username-only endpoint flow
+- Authentication: `UserName`
+- Authentication: `Certificate`, using the configured/generated TermUA client certificate and private key as the user credential certificate
 
 Not supported today:
 
-- Message security: `Sign`
-- Message security: `SignAndEncrypt`
-- Authentication: `Certificate`
 - Authentication: `IssuedToken`
 
-Certificate authentication is explicitly future work. The near-term goal is to avoid misleading fallback behavior and make username/password plus secure-channel support clear and testable.
+Issued-token authentication remains future work. The near-term goal is to avoid misleading fallback behavior and make username/password, certificate authentication, and secure-channel support clear and testable.
 
 ---
 
@@ -46,11 +46,11 @@ When a discovered endpoint advertises only `UserName` authentication, the Server
 
 ### What to build
 
-If an endpoint advertises authentication modes that are not currently supported, the connection flow should fail early with clear feedback instead of silently attempting anonymous authentication. `Certificate` authentication should be treated as future work, not implemented in this slice.
+If an endpoint advertises authentication modes that are not currently supported, the connection flow should fail early with clear feedback instead of silently attempting anonymous authentication. `IssuedToken` authentication should be treated as future work, not implemented in this slice.
 
 ### Acceptance criteria
 
-- [x] Selecting `Certificate` auth does not produce an anonymous `ConnectRequest`.
+- [x] Selecting `Certificate` auth produces a certificate-auth `ConnectRequest` when client certificate/key material is configured.
 - [x] Selecting `IssuedToken` auth does not produce an anonymous `ConnectRequest`.
 - [x] Unsupported auth produces a clear status/error message in the Server Connection flow.
 - [x] Backend connection code rejects unknown `AuthType` values explicitly.
@@ -72,7 +72,7 @@ Decide how the OPC UA Client TUI should receive client certificate and private k
 - [x] The chosen source of client certificate/key material is documented.
 - [x] The decision states whether cert/key paths are global app configuration or per Saved Connection metadata.
 - [x] The decision states how missing certificate/key material should be reported when selecting secure endpoints.
-- [x] Certificate authentication remains out of scope and is recorded as future work.
+- [x] Certificate authentication uses the same global client certificate/key material as secure message modes.
 
 ---
 
@@ -126,7 +126,7 @@ The endpoint discovery view should tell the Automation Engineer whether each adv
 
 - [x] Endpoint rows indicate when username/password is required.
 - [x] Endpoint rows indicate when client certificate/key configuration is required for secure message modes.
-- [x] Endpoint rows indicate unsupported authentication modes such as `Certificate` and `IssuedToken`.
+- [x] Endpoint rows indicate unsupported authentication modes such as `IssuedToken`.
 - [x] The default endpoint selection prefers currently connectable endpoints where possible.
 - [x] Tests cover capability labels and default selection behavior.
 
@@ -134,6 +134,6 @@ The endpoint discovery view should tell the Automation Engineer whether each adv
 
 ## Future work
 
-- Certificate-based user authentication (`UserTokenTypeCertificate`).
+- Separate user-credential certificate/key configuration, if real servers require it instead of reusing the TermUA client application certificate.
 - Issued-token authentication (`UserTokenTypeIssuedToken`).
 - Trust-store management and server certificate trust decisions, if needed beyond the OPC UA client library defaults.
