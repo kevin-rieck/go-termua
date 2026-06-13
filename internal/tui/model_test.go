@@ -516,7 +516,7 @@ func TestEndpointDiscoveryLabelsUnsupportedAuthentication(t *testing.T) {
 	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
 		SecurityMode:   "None",
 		SecurityPolicy: "None",
-		UserTokenTypes: []string{"Certificate"},
+		UserTokenTypes: []string{"IssuedToken"},
 	}}})
 	view := updated.(Model).View()
 
@@ -1007,7 +1007,7 @@ func TestWizardShowsCredentialFormForUserNameAuth(t *testing.T) {
 	}
 }
 
-func TestWizardRejectsUnsupportedCertificateAuth(t *testing.T) {
+func TestWizardRejectsUnsupportedIssuedTokenAuth(t *testing.T) {
 	client := &fakeClient{}
 	model := NewModel(Dependencies{Client: client})
 	model.connectionInput.SetValue("opc.tcp://localhost:4840")
@@ -1015,17 +1015,17 @@ func TestWizardRejectsUnsupportedCertificateAuth(t *testing.T) {
 	updated, _ := model.Update(endpointDiscoveryMsg{Endpoints: []opcua.Endpoint{{
 		SecurityMode:   "None",
 		SecurityPolicy: "None",
-		UserTokenTypes: []string{"Anonymous", "Certificate"},
+		UserTokenTypes: []string{"Anonymous", "IssuedToken"},
 	}}})
 
 	// Select endpoint → auth selection
 	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
-	// Move to Certificate, select it
+	// Move to IssuedToken, select it
 	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyDown})
 	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
 
 	view := updated.(Model).View()
-	if !strings.Contains(view, "unsupported authentication") || !strings.Contains(view, "Certificate") {
+	if !strings.Contains(view, "unsupported authentication") || !strings.Contains(view, "IssuedToken") {
 		t.Fatalf("expected unsupported auth error in view:\n%s", view)
 	}
 	if !strings.Contains(view, "Authentication Options") {

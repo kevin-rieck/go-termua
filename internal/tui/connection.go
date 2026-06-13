@@ -134,6 +134,17 @@ func (c *ServerConnection) Submit() []ServerConnectionRequest {
 		c.status = ServerConnectionEnteringCredentials
 		return nil
 	}
+	if len(authTypes) == 1 && opcua.AuthType(authTypes[0]) == opcua.AuthCertificate {
+		if c.connectionRequiresCertificateFiles(selected, opcua.AuthCertificate) {
+			c.failMissingConnectionCertificate()
+			return nil
+		}
+		request := c.connectRequest(selected, opcua.AuthCertificate)
+		c.connecting = true
+		c.connected = false
+		c.status = ServerConnectionConnecting
+		return []ServerConnectionRequest{{Kind: ServerConnectionRequestConnectEndpoint, Connect: request}}
+	}
 	if len(authTypes) == 1 && opcua.AuthType(authTypes[0]) != opcua.AuthAnonymous {
 		c.connecting = false
 		c.authTypes = nil
@@ -148,8 +159,8 @@ func (c *ServerConnection) Submit() []ServerConnectionRequest {
 		c.status = ServerConnectionEndpointRequiresCredentials
 		return nil
 	}
-	if c.secureEndpointRequiresCertificate(selected) {
-		c.failMissingSecureEndpointCertificate()
+	if c.connectionRequiresCertificateFiles(selected, opcua.AuthAnonymous) {
+		c.failMissingConnectionCertificate()
 		return nil
 	}
 	request := c.connectRequest(selected, opcua.AuthAnonymous)
@@ -183,15 +194,15 @@ func (c *ServerConnection) SelectAuthType(index int) []ServerConnectionRequest {
 		c.status = ServerConnectionEnteringCredentials
 		return nil
 	}
-	if authType != opcua.AuthAnonymous {
+	if authType != opcua.AuthAnonymous && authType != opcua.AuthCertificate {
 		c.connecting = false
 		c.lastError = "unsupported authentication mode: " + string(authType)
 		c.status = ServerConnectionSelectingAuthType
 		return nil
 	}
 	selected := c.endpoints[c.selectedEndpoint]
-	if c.secureEndpointRequiresCertificate(selected) {
-		c.failMissingSecureEndpointCertificate()
+	if c.connectionRequiresCertificateFiles(selected, authType) {
+		c.failMissingConnectionCertificate()
 		return nil
 	}
 
@@ -213,8 +224,8 @@ func (c *ServerConnection) SubmitCredentials() []ServerConnectionRequest {
 		return nil
 	}
 	selected := c.endpoints[c.selectedEndpoint]
-	if c.secureEndpointRequiresCertificate(selected) {
-		c.failMissingSecureEndpointCertificate()
+	if c.connectionRequiresCertificateFiles(selected, opcua.AuthUsername) {
+		c.failMissingConnectionCertificate()
 		return nil
 	}
 
@@ -304,7 +315,7 @@ func (c ServerConnection) endpointCanStartConnection(endpoint opcua.Endpoint) bo
 	}
 	for _, authType := range serverConnectionAuthTypes(endpoint) {
 		auth := opcua.AuthType(authType)
-		if auth == opcua.AuthAnonymous || auth == opcua.AuthUsername {
+		if auth == opcua.AuthAnonymous || auth == opcua.AuthUsername || auth == opcua.AuthCertificate {
 			return true
 		}
 	}
@@ -332,15 +343,19 @@ func (c *ServerConnection) connectRequest(endpoint opcua.Endpoint, authType opcu
 }
 
 func (c *ServerConnection) secureEndpointRequiresCertificate(endpoint opcua.Endpoint) bool {
-	securityMode := serverConnectionCompactSecurityMode(endpoint.SecurityMode)
-	return securityMode != "None" && (c.clientCertificatePath == "" || c.clientPrivateKeyPath == "")
+	return c.connectionRequiresCertificateFiles(endpoint, opcua.AuthAnonymous)
 }
 
-func (c *ServerConnection) failMissingSecureEndpointCertificate() {
+func (c *ServerConnection) connectionRequiresCertificateFiles(endpoint opcua.Endpoint, authType opcua.AuthType) bool {
+	securityMode := serverConnectionCompactSecurityMode(endpoint.SecurityMode)
+	return (securityMode != "None" || authType == opcua.AuthCertificate) && (c.clientCertificatePath == "" || c.clientPrivateKeyPath == "")
+}
+
+func (c *ServerConnection) failMissingConnectionCertificate() {
 	c.connecting = false
 	c.authTypes = nil
 	c.selectedAuthType = 0
-	c.lastError = "secure endpoint requires client certificate and private key"
+	c.lastError = "certificate connection requires client certificate and private key"
 	c.status = ServerConnectionFailed
 }
 

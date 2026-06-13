@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gopcua/opcua/ua"
 )
 
 func TestClientConnectRejectsSecureEndpointWithoutCertificateAndKey(t *testing.T) {
@@ -116,8 +118,41 @@ func TestSecureConnectErrorExplainsServerClosedSecureChannel(t *testing.T) {
 	}
 }
 
+func TestClientConnectRejectsCertificateAuthWithoutCertificateAndKey(t *testing.T) {
+	client := &gopcuaClient{}
+
+	err := client.Connect(context.Background(), ConnectRequest{
+		Endpoint:       "opc.tcp://localhost:4840",
+		SecurityPolicy: "None",
+		SecurityMode:   "None",
+		AuthType:       AuthCertificate,
+	})
+
+	if err == nil {
+		t.Fatal("expected missing certificate/key error")
+	}
+	if !strings.Contains(err.Error(), "client certificate and private key") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestCertificateAuthErrorExplainsServerRejectedUserCertificate(t *testing.T) {
+	err := secureConnectError(ConnectRequest{
+		SecurityMode:          "None",
+		AuthType:              AuthCertificate,
+		ClientCertificatePath: "certificates/client-cert.pem",
+	}, ua.StatusBadIdentityTokenRejected)
+
+	if err == nil {
+		t.Fatal("expected certificate auth error")
+	}
+	if !strings.Contains(err.Error(), "trust the TermUA client certificate as a user certificate") || !strings.Contains(err.Error(), "certificates/client-cert.pem") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestClientConnectRejectsUnsupportedAuthType(t *testing.T) {
-	for _, authType := range []AuthType{AuthType("Certificate"), AuthType("IssuedToken")} {
+	for _, authType := range []AuthType{AuthType("IssuedToken")} {
 		t.Run(string(authType), func(t *testing.T) {
 			client := &gopcuaClient{}
 

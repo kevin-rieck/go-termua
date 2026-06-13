@@ -304,7 +304,7 @@ func TestServerConnectionSelectUserNameAuthTransitionsToEnteringCredentials(t *t
 	}
 }
 
-func TestServerConnectionCertificateOnlyEndpointFailsWithoutConnectRequest(t *testing.T) {
+func TestServerConnectionCertificateOnlyEndpointWithoutCertificateFailsBeforeConnect(t *testing.T) {
 	connection := NewServerConnection("opc.tcp://localhost:4840")
 	connection.ApplyDiscovery([]opcua.Endpoint{{SecurityPolicy: "None", SecurityMode: "None", UserTokenTypes: []string{"Certificate"}}}, nil)
 
@@ -312,35 +312,49 @@ func TestServerConnectionCertificateOnlyEndpointFailsWithoutConnectRequest(t *te
 	view := connection.View()
 
 	if len(requests) != 0 {
-		t.Fatalf("expected no connect request for unsupported auth, got %#v", requests)
+		t.Fatalf("expected no connect request without certificate/key, got %#v", requests)
 	}
 	if view.Status != ServerConnectionFailed {
 		t.Fatalf("status = %v, expected Failed", view.Status)
 	}
-	if !strings.Contains(view.LastError, "unsupported authentication") || !strings.Contains(view.LastError, "Certificate") {
+	if !strings.Contains(view.LastError, "client certificate and private key") {
 		t.Fatalf("last error = %q", view.LastError)
 	}
 }
 
-func TestServerConnectionSelectCertificateAuthFailsWithoutConnectRequest(t *testing.T) {
+func TestServerConnectionCertificateOnlyEndpointWithCertificateConnects(t *testing.T) {
 	connection := NewServerConnection("opc.tcp://localhost:4840")
+	connection.SetClientCertificatePaths("cert.pem", "key.pem")
+	connection.ApplyDiscovery([]opcua.Endpoint{{SecurityPolicy: "None", SecurityMode: "None", UserTokenTypes: []string{"Certificate"}}}, nil)
+
+	requests := connection.Submit()
+	view := connection.View()
+
+	if len(requests) != 1 || requests[0].Connect.AuthType != opcua.AuthCertificate {
+		t.Fatalf("requests = %#v", requests)
+	}
+	if requests[0].Connect.ClientCertificatePath != "cert.pem" || requests[0].Connect.ClientPrivateKeyPath != "key.pem" {
+		t.Fatalf("cert/key paths = %q / %q", requests[0].Connect.ClientCertificatePath, requests[0].Connect.ClientPrivateKeyPath)
+	}
+	if view.Status != ServerConnectionConnecting {
+		t.Fatalf("status = %v, expected Connecting", view.Status)
+	}
+}
+
+func TestServerConnectionSelectCertificateAuthConnects(t *testing.T) {
+	connection := NewServerConnection("opc.tcp://localhost:4840")
+	connection.SetClientCertificatePaths("cert.pem", "key.pem")
 	connection.ApplyDiscovery([]opcua.Endpoint{{SecurityPolicy: "None", SecurityMode: "None", UserTokenTypes: []string{"Anonymous", "Certificate"}}}, nil)
 	connection.Submit() // transitions to SelectingAuthType
 
 	requests := connection.SelectAuthType(1) // select Certificate
 	view := connection.View()
 
-	if len(requests) != 0 {
-		t.Fatalf("expected no connect request for unsupported auth, got %#v", requests)
+	if len(requests) != 1 || requests[0].Connect.AuthType != opcua.AuthCertificate {
+		t.Fatalf("requests = %#v", requests)
 	}
-	if view.Status != ServerConnectionSelectingAuthType {
-		t.Fatalf("status = %v, expected SelectingAuthType", view.Status)
-	}
-	if !view.HasAuthTypeSelection {
-		t.Fatalf("expected auth selection to remain available after unsupported auth")
-	}
-	if !strings.Contains(view.LastError, "unsupported authentication") || !strings.Contains(view.LastError, "Certificate") {
-		t.Fatalf("last error = %q", view.LastError)
+	if view.Status != ServerConnectionConnecting {
+		t.Fatalf("status = %v, expected Connecting", view.Status)
 	}
 }
 

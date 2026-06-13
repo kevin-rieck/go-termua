@@ -1583,7 +1583,7 @@ func connectionStatusLine(view ServerConnectionView) string {
 
 func endpointCapabilityLabel(endpoint opcua.Endpoint, hasClientCertificateAndKey bool) string {
 	securityMode := compactSecurityMode(endpoint.SecurityMode)
-	if securityMode != "None" && !hasClientCertificateAndKey {
+	if (securityMode != "None" || endpointSupportsOnlyAuth(endpoint, opcua.AuthCertificate)) && !hasClientCertificateAndKey {
 		return "cert/key"
 	}
 	if endpointHasUnsupportedAuth(endpoint) {
@@ -1605,7 +1605,7 @@ func endpointSupportsOnlyAuth(endpoint opcua.Endpoint, auth opcua.AuthType) bool
 func endpointHasUnsupportedAuth(endpoint opcua.Endpoint) bool {
 	for _, token := range endpoint.UserTokenTypes {
 		normalized := strings.TrimPrefix(strings.TrimSpace(token), "UserTokenType")
-		if normalized != string(opcua.AuthAnonymous) && normalized != string(opcua.AuthUsername) {
+		if normalized != string(opcua.AuthAnonymous) && normalized != string(opcua.AuthUsername) && normalized != string(opcua.AuthCertificate) {
 			return true
 		}
 	}
