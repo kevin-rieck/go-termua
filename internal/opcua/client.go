@@ -3,9 +3,13 @@ package opcua
 import (
 	"context"
 	"crypto/sha1"
+	"crypto/x509"
 	"encoding/hex"
+	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -126,8 +130,13 @@ func (c *gopcuaClient) Connect(ctx context.Context, request ConnectRequest) erro
 	if request.AuthType != AuthAnonymous && request.AuthType != AuthUsername {
 		return fmt.Errorf("unsupported authentication mode: %s", request.AuthType)
 	}
-	if compactMessageSecurityMode(request.SecurityMode) != "None" && (request.ClientCertificatePath == "" || request.ClientPrivateKeyPath == "") {
-		return fmt.Errorf("secure endpoint requires client certificate and private key")
+	if compactMessageSecurityMode(request.SecurityMode) != "None" {
+		if request.ClientCertificatePath == "" || request.ClientPrivateKeyPath == "" {
+			return fmt.Errorf("secure endpoint requires client certificate and private key")
+		}
+		if err := validateSecureEndpointCertificateFiles(request.ClientCertificatePath, request.ClientPrivateKeyPath); err != nil {
+			return err
+		}
 	}
 	securityMode := ua.MessageSecurityModeFromString(request.SecurityMode)
 	endpoints, err := gopcua.GetEndpoints(ctx, request.Endpoint)
@@ -155,7 +164,7 @@ func (c *gopcuaClient) Connect(ctx context.Context, request ConnectRequest) erro
 	}
 	if err := client.Connect(ctx); err != nil {
 		log.Printf("opcua: Connect failed endpointURL=%s error=%v", ep.EndpointURL, err)
-		return err
+		return secureConnectError(request, err)
 	}
 	log.Printf("opcua: Connect succeeded endpointURL=%s", ep.EndpointURL)
 
@@ -537,6 +546,86 @@ func compactMessageSecurityMode(mode string) string {
 		return "Unknown"
 	}
 	return mode
+}
+
+func secureConnectError(request ConnectRequest, err error) error {
+	if compactMessageSecurityMode(request.SecurityMode) == "None" {
+		return err
+	}
+	if errorsIsEOF(err) {
+		return fmt.Errorf("secure channel closed by server; trust the TermUA client application certificate in the OPC UA Server and retry: %s", request.ClientCertificatePath)
+	}
+	return err
+}
+
+func errorsIsEOF(err error) bool {
+	return err == io.EOF || strings.TrimSpace(err.Error()) == "EOF"
+}
+
+func validateSecureEndpointCertificateFiles(certificatePath, privateKeyPath string) error {
+	if err := validateCertificateFile(certificatePath); err != nil {
+		return err
+	}
+	if err := validatePrivateKeyFile(privateKeyPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateCertificateFile(path string) error {
+	data, err := readRegularFile("client certificate file", path)
+	if err != nil {
+		return err
+	}
+	der := data
+	if strings.HasSuffix(path, ".pem") {
+		block, _ := pem.Decode(data)
+		if block == nil || block.Type != "CERTIFICATE" {
+			return fmt.Errorf("client certificate file is not a PEM certificate: %s", path)
+		}
+		der = block.Bytes
+	}
+	if _, err := x509.ParseCertificate(der); err != nil {
+		return fmt.Errorf("client certificate file is invalid: %s: %w", path, err)
+	}
+	return nil
+}
+
+func validatePrivateKeyFile(path string) error {
+	data, err := readRegularFile("client private key file", path)
+	if err != nil {
+		return err
+	}
+	der := data
+	if strings.HasSuffix(path, ".pem") {
+		block, _ := pem.Decode(data)
+		if block == nil || block.Type != "RSA PRIVATE KEY" {
+			return fmt.Errorf("client private key file is not a PEM RSA private key: %s", path)
+		}
+		der = block.Bytes
+	}
+	if _, err := x509.ParsePKCS1PrivateKey(der); err != nil {
+		return fmt.Errorf("client private key file is invalid: %s: %w", path, err)
+	}
+	return nil
+}
+
+func readRegularFile(label, path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%s not found: %s", label, path)
+		}
+		return nil, fmt.Errorf("%s cannot be accessed: %s: %w", label, path, err)
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("%s is a directory: %s", label, path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("%s cannot be read: %s: %w", label, path, err)
+	}
+	return data, nil
 }
 
 func endpointFromDescription(ep *ua.EndpointDescription) Endpoint {

@@ -12,14 +12,19 @@ Certificate-based user authentication is separate and remains future work.
 
 ## Decision
 
-TermUA receives client certificate and private key paths as global launch configuration:
+TermUA uses a global client application certificate and private key for secure message modes. By default, it creates and reuses a standard self-signed client application certificate under the app config directory:
+
+- `certificates/client-cert.pem`
+- `certificates/client-key.pem`
+
+Automation Engineers may override those paths at launch:
 
 - `--client-certificate PATH`
 - `--client-private-key PATH`
 
 These paths apply to all secure Server Connections during the current app run. They are not stored in Saved Connection metadata in this slice. Saved Connections may continue to store known-good endpoint, security, and authentication choices without embedding local certificate/key file paths.
 
-Future config-file support may persist the same global values, but CLI flags are the first supported source.
+The client application certificate is only for OPC UA message security (`Sign` / `SignAndEncrypt`). Certificate-based user authentication remains future work.
 
 ## Missing material behavior
 
@@ -27,8 +32,10 @@ When an Automation Engineer selects a secure endpoint (`Sign` or `SignAndEncrypt
 
 `secure endpoint requires client certificate and private key`
 
+When configured certificate/key files are missing or invalid, the Server Connection flow must fail before connecting with a clear file-specific error.
+
 ## Consequences
 
-- First-run usage is explicit: pass both CLI flags when secure endpoints are needed.
-- Repeat usage can be supported later by global config without changing `ConnectRequest` semantics.
+- First-run usage works without choosing files in the TUI; the generated client application certificate can be trusted in servers that require trust-list approval.
+- CLI flags remain available for sites with managed client certificates.
 - Certificate user authentication (`UserTokenTypeCertificate`) remains unsupported and is treated as future work.
