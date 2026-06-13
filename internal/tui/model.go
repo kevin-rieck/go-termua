@@ -22,9 +22,10 @@ import (
 )
 
 type Dependencies struct {
-	Client opcua.Client
-	Paths  config.Paths
-	Launch app.LaunchOptions
+	Client     opcua.Client
+	Paths      config.Paths
+	Launch     app.LaunchOptions
+	OpenFolder func(string) error
 }
 
 type focus int
@@ -77,10 +78,16 @@ type selectedNodeDetailsMsg struct {
 	Err     error
 }
 
+type openCertificateFolderMsg struct {
+	Path string
+	Err  error
+}
+
 type Model struct {
-	client opcua.Client
-	paths  config.Paths
-	launch app.LaunchOptions
+	client     opcua.Client
+	paths      config.Paths
+	launch     app.LaunchOptions
+	openFolder func(string) error
 
 	width               int
 	height              int
@@ -134,11 +141,16 @@ func NewModel(deps Dependencies) Model {
 
 	connection := NewServerConnection(deps.Launch.Endpoint)
 	connection.SetClientCertificatePaths(deps.Launch.ClientCertificatePath, deps.Launch.ClientPrivateKeyPath)
+	openFolder := deps.OpenFolder
+	if openFolder == nil {
+		openFolder = app.OpenFolder
+	}
 
 	return Model{
 		client:              deps.Client,
 		paths:               deps.Paths,
 		launch:              deps.Launch,
+		openFolder:          openFolder,
 		width:               120,
 		height:              30,
 		focus:               focusTree,
@@ -189,6 +201,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.connectionModalOpen = true
 			}
+		case "ctrl+o":
+			return m, tea.Batch(toastCmd, m.openCertificateFolder())
 		case "tab":
 			m.focus = (m.focus + 1) % 3
 			m.syncRightPaneWithFocus()
@@ -253,7 +267,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Err != nil {
 			log.Printf("endpoint connection failed: %v", msg.Err)
 			m.statusLine = connectionStatusLine(view)
-			return m, tea.Batch(toastCmd, m.pushConnectionErrorToast(view.LastError, "Connection failed"))
+			return m, tea.Batch(toastCmd, m.pushConnectionErrorToast(view.LastError, "Connection failed"), m.pushSecureChannelTrustHintToast(msg.Request, view.LastError))
 		}
 		log.Printf("endpoint connection succeeded: endpoint=%s securityPolicy=%s securityMode=%s authType=%s", msg.Request.Endpoint, msg.Request.SecurityPolicy, msg.Request.SecurityMode, msg.Request.AuthType)
 		m.connectedRequest = msg.Request
@@ -269,6 +283,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.applySelectedValue(msg)
 	case selectedNodeDetailsMsg:
 		return m.applySelectedNodeDetails(msg)
+	case openCertificateFolderMsg:
+		if msg.Err != nil {
+			message := "Open certificate folder failed: " + msg.Err.Error()
+			m.statusLine = "Read-Only Mode · " + message
+			return m, tea.Batch(toastCmd, m.pushConnectionErrorToast(message, "Certificate folder"))
+		}
+		m.statusLine = "Read-Only Mode · opened certificate folder"
+		var cmd tea.Cmd
+		m.toasts, _, cmd = m.toasts.Push(toast.Info(msg.Path, toast.WithTitle("Certificate folder"), toast.WithID("certificate-folder")))
+		return m, tea.Batch(toastCmd, cmd)
 	}
 	return m, toastCmd
 }
@@ -510,6 +534,8 @@ func (m Model) updateConnectionModal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.showHelp = !m.showHelp
 		return m, nil
+	case "ctrl+o":
+		return m, m.openCertificateFolder()
 	case "esc":
 		if view.Status == ServerConnectionSelectingAuthType || view.Status == ServerConnectionEnteringCredentials {
 			m.connection.Back()
@@ -645,6 +671,24 @@ func (m *Model) pushConnectionErrorToast(message, title string) tea.Cmd {
 	var cmd tea.Cmd
 	m.toasts, _, cmd = m.toasts.Push(toast.Error(message, toast.WithTitle(title), toast.WithID("connection-error")))
 	return cmd
+}
+
+func (m *Model) pushSecureChannelTrustHintToast(request opcua.ConnectRequest, errMessage string) tea.Cmd {
+	if !isSecureChannelTrustError(errMessage) {
+		return nil
+	}
+	certPath := strings.TrimSpace(request.ClientCertificatePath)
+	message := "Trust the TermUA client application certificate in the OPC UA Server, then retry."
+	if certPath != "" {
+		message += " Certificate: " + certPath
+	}
+	var cmd tea.Cmd
+	m.toasts, _, cmd = m.toasts.Push(toast.Info(message, toast.WithTitle("Trust client certificate"), toast.WithID("connection-trust-hint")))
+	return cmd
+}
+
+func isSecureChannelTrustError(message string) bool {
+	return strings.Contains(message, "secure channel closed by server") || strings.Contains(message, "trust the TermUA client application certificate")
 }
 
 func (m *Model) pushConnectionSuccessToast(request opcua.ConnectRequest) tea.Cmd {
@@ -816,9 +860,9 @@ func (m Model) topBar(width int) string {
 
 func (m Model) footer(width int) string {
 	left := footerStyle.Render(m.statusLine)
-	rightHint := "Tab focus · ? help · q quit"
+	rightHint := "Tab focus · Ctrl+O certs · ? help · q quit"
 	if m.hasEndpointSelection() {
-		rightHint = "↑/↓ endpoint · Enter connect · ? help · q quit"
+		rightHint = "↑/↓ endpoint · Enter connect · Ctrl+O certs · ? help · q quit"
 	} else if m.focus == focusTree && m.connection.View().Connected {
 		rightHint = "↑/↓ node · Enter expand · w watch · ← collapse · ? help · q quit"
 	} else if m.focus == focusWatchlist {
@@ -871,6 +915,7 @@ func (m Model) helpView() string {
 			"w           Add Variable Node to Watchlist",
 			"s           Export Snapshot",
 			"d           Export Diagnostics Bundle",
+			"Ctrl+O      Open client certificate folder",
 			"Tab         Move focus",
 			"Esc or ?    Close help",
 			"q           Quit",
@@ -941,6 +986,12 @@ func waitForSelectedValueCmd(nodeID string, updates <-chan opcua.LiveValue) tea.
 			return selectedValueMsg{NodeID: nodeID, Err: fmt.Errorf("subscription closed")}
 		}
 		return selectedValueMsg{NodeID: nodeID, Value: value}
+	}
+}
+
+func openCertificateFolderCmd(openFolder func(string) error, path string) tea.Cmd {
+	return func() tea.Msg {
+		return openCertificateFolderMsg{Path: path, Err: openFolder(path)}
 	}
 }
 
@@ -1132,6 +1183,26 @@ func (m Model) applySelectedNodeDetails(msg selectedNodeDetailsMsg) (tea.Model, 
 	return m, nil
 }
 
+func (m *Model) openCertificateFolder() tea.Cmd {
+	path := m.certificateFolderPath()
+	if path == "" {
+		message := "Open certificate folder failed: certificate folder is unknown"
+		m.statusLine = "Read-Only Mode · " + message
+		return m.pushConnectionErrorToast(message, "Certificate folder")
+	}
+	return openCertificateFolderCmd(m.openFolder, path)
+}
+
+func (m Model) certificateFolderPath() string {
+	if certPath := strings.TrimSpace(m.launch.ClientCertificatePath); certPath != "" {
+		return filepath.Dir(certPath)
+	}
+	if m.paths.ConfigDir == "" {
+		return ""
+	}
+	return config.ClientCertificateDir(m.paths)
+}
+
 func (m *Model) exportSnapshot() tea.Cmd {
 	watched := m.inspections.Watched()
 	if len(watched) == 0 {
@@ -1182,7 +1253,7 @@ func (m Model) snapshotMarkdown(watched []session.VariableNodeInspection) string
 	appendMarkdownField(&b, "Authentication", string(m.connectedRequest.AuthType))
 	b.WriteString("\n## Watchlist\n")
 	for _, item := range watched {
-		b.WriteString("\n### "+markdownText(item.Node.DisplayName)+"\n\n")
+		b.WriteString("\n### " + markdownText(item.Node.DisplayName) + "\n\n")
 		appendMarkdownField(&b, "NodeId", item.Node.NodeID)
 		appendMarkdownField(&b, "NodeClass", item.Node.NodeClass)
 		if item.Value.Value == "" {

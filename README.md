@@ -74,6 +74,7 @@ Use `Tab` to switch focus between the Address Space tree, the Inspection pane, a
 | `Left` or `h` | Collapse tree node |
 | `w` | Add selected node to Watchlist |
 | `s` | Export snapshot of current data |
+| `Ctrl+O` | Open the client certificate folder |
 | `?` | Toggle help menu |
 | `q` or `Ctrl+C` | Quit TermUA cleanly |
 
