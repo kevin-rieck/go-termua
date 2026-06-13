@@ -320,7 +320,7 @@ func TestHelpToggle(t *testing.T) {
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
 	view := updated.(Model).View()
 
-	if !strings.Contains(view, "Export Diagnostics Bundle") {
+	if !strings.Contains(view, "Export Diagnostics Bundle") || !strings.Contains(view, "Open exports folder") {
 		t.Fatalf("expected help view:\n%s", view)
 	}
 }
@@ -367,8 +367,8 @@ func TestSnapshotExportWritesCurrentWatchlist(t *testing.T) {
 		t.Fatalf("expected successful Snapshot export status:\n%s", view)
 	}
 	visibleToasts := updated.(Model).toasts.Visible()
-	if !hasToast(visibleToasts, toast.KindSuccess, "snapshot-") {
-		t.Fatalf("expected success toast for Snapshot export, got %#v", visibleToasts)
+	if !hasToast(visibleToasts, toast.KindSuccess, "Press o to open the exports folder") {
+		t.Fatalf("expected success toast with next action for Snapshot export, got %#v", visibleToasts)
 	}
 
 	files, err := filepath.Glob(filepath.Join(exportDir, "exports", "snapshot-*.md"))
@@ -387,6 +387,101 @@ func TestSnapshotExportWritesCurrentWatchlist(t *testing.T) {
 	}
 	if strings.Contains(content, "secret-password") {
 		t.Fatalf("Snapshot leaked password:\n%s", content)
+	}
+}
+
+func TestDiagnosticsBundleExportWritesCurrentSessionState(t *testing.T) {
+	exporter := &fakeDiagnosticsExporter{path: "diagnostics.md"}
+	log := NewDiagnosticLog(10)
+	log.now = func() time.Time { return time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC) }
+	model := NewModel(Dependencies{
+		Paths:               config.Paths{ConfigDir: "config-dir", CacheDir: "cache-dir"},
+		DiagnosticsExporter: exporter,
+		DiagnosticLog:       log,
+	})
+	model.connectionModalOpen = false
+	request := opcua.ConnectRequest{Endpoint: "opc.tcp://server:4840", SecurityMode: "None", SecurityPolicy: "None", AuthType: opcua.AuthUsername, Username: "engineer", Password: "secret-password"}
+	model.connection.ApplyConnection(request, nil)
+	model.connectedRequest = request
+	model.statusLine = "Read-Only Mode · selected Live Value updated · Temperature"
+	model.diagnosticsLog.Add("Subscription restored for ns=2;s=Temperature")
+
+	node := opcua.AddressNode{NodeID: "ns=2;s=Temperature", DisplayName: "Temperature", NodeClass: "Variable"}
+	model.inspections.Select(node)
+	model.inspections.Watch(node)
+	model.inspections.ApplyLiveValue(node.NodeID, opcua.LiveValue{NodeID: node.NodeID, Value: "42", Status: "StatusOK"}, nil)
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	view := updated.(Model).View()
+	if !strings.Contains(view, "Diagnostics Bundle exported") {
+		t.Fatalf("expected successful Diagnostics Bundle export status:\n%s", view)
+	}
+	visibleToasts := updated.(Model).toasts.Visible()
+	if !hasToast(visibleToasts, toast.KindSuccess, "Press o to open the exports folder") {
+		t.Fatalf("expected success toast with next action for Diagnostics Bundle export, got %#v", visibleToasts)
+	}
+	content := exporter.content
+	for _, expected := range []string{"# Diagnostics Bundle", "endpoints, node names, process values", "opc.tcp://server:4840", "None", "UserName", "Connected", "Temperature", "ns=2;s=Temperature", "42", "StatusOK", "Read-Only Mode · selected Live Value updated", "config-dir", "cache-dir", "Subscription restored"} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("expected %q in Diagnostics Bundle:\n%s", expected, content)
+		}
+	}
+	if strings.Contains(content, "secret-password") {
+		t.Fatalf("Diagnostics Bundle leaked password:\n%s", content)
+	}
+}
+
+func TestDiagnosticsBundleExportFailureIsVisible(t *testing.T) {
+	model := NewModel(Dependencies{DiagnosticsExporter: &fakeDiagnosticsExporter{err: fmt.Errorf("disk full")}})
+	model.connectionModalOpen = false
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	view := updated.(Model).View()
+	if !strings.Contains(view, "Diagnostics Bundle export failed: disk full") {
+		t.Fatalf("expected failed Diagnostics Bundle export status:\n%s", view)
+	}
+	visibleToasts := updated.(Model).toasts.Visible()
+	if !hasToast(visibleToasts, toast.KindError, "disk full") {
+		t.Fatalf("expected error toast for Diagnostics Bundle export, got %#v", visibleToasts)
+	}
+}
+
+func TestOpenExportsFolderShortcutOpensConfiguredExportsDirectory(t *testing.T) {
+	opener := &fakeExportFolderOpener{}
+	cacheDir := t.TempDir()
+	model := NewModel(Dependencies{Paths: config.Paths{CacheDir: cacheDir}, ExportFolderOpener: opener})
+	model.connectionModalOpen = false
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	view := updated.(Model).View()
+	expectedPath := filepath.Join(cacheDir, "exports")
+	if opener.path != expectedPath {
+		t.Fatalf("opened path = %q, want %q", opener.path, expectedPath)
+	}
+	if !strings.Contains(view, "opened exports folder") {
+		t.Fatalf("expected opened exports folder status:\n%s", view)
+	}
+	if _, err := os.Stat(expectedPath); err != nil {
+		t.Fatalf("expected exports folder created: %v", err)
+	}
+	visibleToasts := updated.(Model).toasts.Visible()
+	if !hasToast(visibleToasts, toast.KindSuccess, "Exports folder opened") {
+		t.Fatalf("expected success toast for open exports folder, got %#v", visibleToasts)
+	}
+}
+
+func TestOpenExportsFolderFailureIsVisible(t *testing.T) {
+	model := NewModel(Dependencies{ExportFolderOpener: &fakeExportFolderOpener{err: fmt.Errorf("no opener")}})
+	model.connectionModalOpen = false
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	view := updated.(Model).View()
+	if !strings.Contains(view, "Open exports folder failed: no opener") {
+		t.Fatalf("expected open exports folder failure status:\n%s", view)
+	}
+	visibleToasts := updated.(Model).toasts.Visible()
+	if !hasToast(visibleToasts, toast.KindError, "no opener") {
+		t.Fatalf("expected error toast for open exports folder, got %#v", visibleToasts)
 	}
 }
 
@@ -822,6 +917,30 @@ func TestInitDiscoversEndpointWhenProvided(t *testing.T) {
 	if client.discovered != "opc.tcp://localhost:4840" {
 		t.Fatalf("discovered endpoint = %q", client.discovered)
 	}
+}
+
+type fakeExportFolderOpener struct {
+	path string
+	err  error
+}
+
+func (f *fakeExportFolderOpener) OpenExportFolder(path string) error {
+	f.path = path
+	return f.err
+}
+
+type fakeDiagnosticsExporter struct {
+	path    string
+	content string
+	err     error
+}
+
+func (f *fakeDiagnosticsExporter) ExportDiagnostics(markdown string) (string, error) {
+	f.content = markdown
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.path, nil
 }
 
 type fakeClient struct {
