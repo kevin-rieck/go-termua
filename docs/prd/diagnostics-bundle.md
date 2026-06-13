@@ -1,5 +1,9 @@
 # Diagnostics Bundle Export
 
+## Status
+
+Implemented on the `feature/diagnostics-bundle-export` branch. The `d` key exports a timestamped markdown Diagnostics Bundle through a fakeable exporter boundary, recent diagnostic events are retained in a bounded in-memory log, and `o` opens the exports folder for the next user action after export.
+
 ## Problem Statement
 
 Automation Engineers use the OPC UA Client TUI during a Troubleshooting Session against existing OPC UA Servers. When the OPC UA Client TUI itself behaves unexpectedly, fails to connect, loses subscriptions, or shows confusing state, the Automation Engineer has no complete, shareable view of the session diagnostics.
