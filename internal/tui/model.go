@@ -22,9 +22,12 @@ import (
 )
 
 type Dependencies struct {
-	Client opcua.Client
-	Paths  config.Paths
-	Launch app.LaunchOptions
+	Client              opcua.Client
+	Paths               config.Paths
+	Launch              app.LaunchOptions
+	DiagnosticsExporter DiagnosticsExporter
+	DiagnosticLog       *DiagnosticLog
+	ExportFolderOpener  ExportFolderOpener
 }
 
 type focus int
@@ -78,9 +81,12 @@ type selectedNodeDetailsMsg struct {
 }
 
 type Model struct {
-	client opcua.Client
-	paths  config.Paths
-	launch app.LaunchOptions
+	client              opcua.Client
+	paths               config.Paths
+	launch              app.LaunchOptions
+	diagnosticsExporter DiagnosticsExporter
+	diagnosticsLog      *DiagnosticLog
+	exportFolderOpener  ExportFolderOpener
 
 	width               int
 	height              int
@@ -134,11 +140,27 @@ func NewModel(deps Dependencies) Model {
 
 	connection := NewServerConnection(deps.Launch.Endpoint)
 	connection.SetClientCertificatePaths(deps.Launch.ClientCertificatePath, deps.Launch.ClientPrivateKeyPath)
+	diagnosticsExporter := deps.DiagnosticsExporter
+	if diagnosticsExporter == nil {
+		diagnosticsExporter = newFilesystemDiagnosticsExporter(deps.Paths)
+	}
+	diagnosticsLog := deps.DiagnosticLog
+	if diagnosticsLog == nil {
+		diagnosticsLog = NewDiagnosticLog(200)
+	}
+	diagnosticsLog.Add("TermUA started in Read-Only Mode")
+	exportFolderOpener := deps.ExportFolderOpener
+	if exportFolderOpener == nil {
+		exportFolderOpener = systemExportFolderOpener{}
+	}
 
 	return Model{
 		client:              deps.Client,
 		paths:               deps.Paths,
 		launch:              deps.Launch,
+		diagnosticsExporter: diagnosticsExporter,
+		diagnosticsLog:      diagnosticsLog,
+		exportFolderOpener:  exportFolderOpener,
 		width:               120,
 		height:              30,
 		focus:               focusTree,
@@ -230,6 +252,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "s":
 			return m, tea.Batch(toastCmd, m.exportSnapshot())
+		case "d":
+			return m, tea.Batch(toastCmd, m.exportDiagnosticsBundle())
+		case "o":
+			return m, tea.Batch(toastCmd, m.openExportsFolder())
 		case "left", "h":
 			if m.focus == focusTree {
 				m.collapseSelectedNode()
@@ -238,8 +264,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case endpointDiscoveryMsg:
 		if msg.Err != nil {
 			log.Printf("endpoint discovery failed: %v", msg.Err)
+			m.diagnosticsLog.Add("Endpoint discovery failed: " + msg.Err.Error())
 		} else {
 			log.Printf("endpoint discovery succeeded: endpoints=%d", len(msg.Endpoints))
+			m.diagnosticsLog.Add(fmt.Sprintf("Endpoint discovery succeeded: %d endpoint(s)", len(msg.Endpoints)))
 		}
 		m.connection.ApplyDiscovery(msg.Endpoints, msg.Err)
 		view := m.connection.View()
@@ -252,10 +280,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		view := m.connection.View()
 		if msg.Err != nil {
 			log.Printf("endpoint connection failed: %v", msg.Err)
+			m.diagnosticsLog.Add("Server Connection failed: " + msg.Err.Error())
 			m.statusLine = connectionStatusLine(view)
 			return m, tea.Batch(toastCmd, m.pushConnectionErrorToast(view.LastError, "Connection failed"))
 		}
 		log.Printf("endpoint connection succeeded: endpoint=%s securityPolicy=%s securityMode=%s authType=%s", msg.Request.Endpoint, msg.Request.SecurityPolicy, msg.Request.SecurityMode, msg.Request.AuthType)
+		m.diagnosticsLog.Add(fmt.Sprintf("Server Connection succeeded: endpoint=%s securityMode=%s securityPolicy=%s authType=%s", msg.Request.Endpoint, msg.Request.SecurityMode, msg.Request.SecurityPolicy, msg.Request.AuthType))
 		m.connectedRequest = msg.Request
 		m.connectionModalOpen = false
 		m.focus = focusTree
@@ -871,6 +901,7 @@ func (m Model) helpView() string {
 			"w           Add Variable Node to Watchlist",
 			"s           Export Snapshot",
 			"d           Export Diagnostics Bundle",
+			"o           Open exports folder",
 			"Tab         Move focus",
 			"Esc or ?    Close help",
 			"q           Quit",
@@ -1166,9 +1197,115 @@ func (m *Model) pushSnapshotErrorToast(message string) tea.Cmd {
 }
 
 func (m *Model) pushSnapshotSuccessToast(path string) tea.Cmd {
+	_ = path
 	var cmd tea.Cmd
-	m.toasts, _, cmd = m.toasts.Push(toast.Success(path, toast.WithTitle("Snapshot exported"), toast.WithID("snapshot-export")))
+	m.toasts, _, cmd = m.toasts.Push(toast.Success("Press o to open the exports folder.", toast.WithTitle("Snapshot exported"), toast.WithID("snapshot-export")))
 	return cmd
+}
+
+func (m *Model) exportDiagnosticsBundle() tea.Cmd {
+	path, err := m.diagnosticsExporter.ExportDiagnostics(m.diagnosticsMarkdown())
+	if err != nil {
+		message := "Diagnostics Bundle export failed: " + err.Error()
+		m.statusLine = "Read-Only Mode · " + message
+		m.diagnosticsLog.Add(message)
+		return m.pushDiagnosticsErrorToast(message)
+	}
+	m.statusLine = "Read-Only Mode · Diagnostics Bundle exported: " + path
+	m.diagnosticsLog.Add("Diagnostics Bundle exported: " + path)
+	return m.pushDiagnosticsSuccessToast(path)
+}
+
+func (m *Model) pushDiagnosticsErrorToast(message string) tea.Cmd {
+	var cmd tea.Cmd
+	m.toasts, _, cmd = m.toasts.Push(toast.Error(message, toast.WithTitle("Diagnostics Bundle export failed"), toast.WithID("diagnostics-export")))
+	return cmd
+}
+
+func (m *Model) pushDiagnosticsSuccessToast(path string) tea.Cmd {
+	_ = path
+	var cmd tea.Cmd
+	m.toasts, _, cmd = m.toasts.Push(toast.Success("Press o to open the exports folder.", toast.WithTitle("Diagnostics Bundle exported"), toast.WithID("diagnostics-export")))
+	return cmd
+}
+
+func (m *Model) openExportsFolder() tea.Cmd {
+	path := exportsDir(m.paths)
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		message := "Open exports folder failed: " + err.Error()
+		m.statusLine = "Read-Only Mode · " + message
+		m.diagnosticsLog.Add(message)
+		return m.pushOpenExportsFolderErrorToast(message)
+	}
+	if err := m.exportFolderOpener.OpenExportFolder(path); err != nil {
+		message := "Open exports folder failed: " + err.Error()
+		m.statusLine = "Read-Only Mode · " + message
+		m.diagnosticsLog.Add(message)
+		return m.pushOpenExportsFolderErrorToast(message)
+	}
+	m.statusLine = "Read-Only Mode · opened exports folder: " + path
+	m.diagnosticsLog.Add("Opened exports folder: " + path)
+	return m.pushOpenExportsFolderSuccessToast()
+}
+
+func (m *Model) pushOpenExportsFolderErrorToast(message string) tea.Cmd {
+	var cmd tea.Cmd
+	m.toasts, _, cmd = m.toasts.Push(toast.Error(message, toast.WithTitle("Open exports folder failed"), toast.WithID("open-exports-folder")))
+	return cmd
+}
+
+func (m *Model) pushOpenExportsFolderSuccessToast() tea.Cmd {
+	var cmd tea.Cmd
+	m.toasts, _, cmd = m.toasts.Push(toast.Success("Exports folder opened.", toast.WithTitle("Exports folder"), toast.WithID("open-exports-folder")))
+	return cmd
+}
+
+func (m Model) diagnosticsMarkdown() string {
+	view := m.connection.View()
+	watched := m.inspections.Watched()
+	var b strings.Builder
+	b.WriteString("# Diagnostics Bundle\n\n")
+	b.WriteString("> Sensitivity warning: endpoints, node names, process values, and server metadata may be sensitive. Review before sharing. Secrets are excluded.\n\n")
+	b.WriteString("## Server Connection\n\n")
+	appendMarkdownField(&b, "Endpoint", diagnosticsEndpoint(m.connectedRequest.Endpoint, view.EndpointText))
+	appendMarkdownField(&b, "Security Mode", compactSecurityMode(m.connectedRequest.SecurityMode))
+	appendMarkdownField(&b, "Security Policy", m.connectedRequest.SecurityPolicy)
+	appendMarkdownField(&b, "Authentication", string(m.connectedRequest.AuthType))
+	appendMarkdownField(&b, "Connection State", serverConnectionStatusText(view.Status))
+	appendMarkdownField(&b, "Connected", fmt.Sprintf("%t", view.Connected))
+	appendMarkdownField(&b, "Last Error", view.LastError)
+	appendMarkdownField(&b, "Last Visible Status", m.statusLine)
+
+	b.WriteString("\n## Selected Variable Node\n\n")
+	if selected, ok := m.inspections.Selected(); ok {
+		appendDiagnosticsInspection(&b, selected, true)
+	} else {
+		b.WriteString("No Variable Node selected.\n")
+	}
+
+	b.WriteString("\n## Watchlist and Subscriptions\n\n")
+	appendMarkdownField(&b, "Watched Variable Nodes", fmt.Sprintf("%d", len(watched)))
+	appendMarkdownField(&b, "Subscription Count", fmt.Sprintf("%d", activeSubscriptionCount(watched)))
+	for _, item := range watched {
+		b.WriteString("\n### " + markdownText(item.Node.DisplayName) + "\n\n")
+		appendDiagnosticsInspection(&b, item, false)
+	}
+
+	b.WriteString("\n## Local Paths\n\n")
+	appendMarkdownField(&b, "Config Directory", m.paths.ConfigDir)
+	appendMarkdownField(&b, "Cache Directory", m.paths.CacheDir)
+	appendMarkdownField(&b, "Export Directory", exportsDir(m.paths))
+
+	b.WriteString("\n## Recent Diagnostic Events\n\n")
+	events := m.diagnosticsLog.Events()
+	if len(events) == 0 {
+		b.WriteString("No diagnostic events recorded.\n")
+	} else {
+		for _, event := range events {
+			appendMarkdownField(&b, event.Timestamp.UTC().Format(time.RFC3339), event.Message)
+		}
+	}
+	return b.String()
 }
 
 func (m Model) snapshotMarkdown(watched []session.VariableNodeInspection) string {
@@ -1182,7 +1319,7 @@ func (m Model) snapshotMarkdown(watched []session.VariableNodeInspection) string
 	appendMarkdownField(&b, "Authentication", string(m.connectedRequest.AuthType))
 	b.WriteString("\n## Watchlist\n")
 	for _, item := range watched {
-		b.WriteString("\n### "+markdownText(item.Node.DisplayName)+"\n\n")
+		b.WriteString("\n### " + markdownText(item.Node.DisplayName) + "\n\n")
 		appendMarkdownField(&b, "NodeId", item.Node.NodeID)
 		appendMarkdownField(&b, "NodeClass", item.Node.NodeClass)
 		if item.Value.Value == "" {
@@ -1206,6 +1343,83 @@ func (m Model) snapshotMarkdown(watched []session.VariableNodeInspection) string
 		}
 	}
 	return b.String()
+}
+
+func appendDiagnosticsInspection(b *strings.Builder, item session.VariableNodeInspection, includeHeading bool) {
+	if includeHeading {
+		b.WriteString("### " + markdownText(item.Node.DisplayName) + "\n\n")
+	}
+	appendMarkdownField(b, "DisplayName", item.Node.DisplayName)
+	appendMarkdownField(b, "NodeId", item.Node.NodeID)
+	appendMarkdownField(b, "NodeClass", item.Node.NodeClass)
+	appendMarkdownField(b, "Live Value", item.Value.Value)
+	appendMarkdownField(b, "OPC UA StatusCode", item.Value.Status)
+	appendMarkdownField(b, "Stale Value", fmt.Sprintf("%t", item.Stale))
+	if item.OutOfRange != "" {
+		appendMarkdownField(b, "Out-of-Range", item.OutOfRange)
+	}
+	if item.Subscription != nil {
+		appendMarkdownField(b, "Subscription", "active")
+	} else if item.Subscribing {
+		appendMarkdownField(b, "Subscription", "subscribing")
+	} else if item.Err != nil {
+		appendMarkdownField(b, "Subscription", item.Err.Error())
+	} else {
+		appendMarkdownField(b, "Subscription", "not active")
+	}
+}
+
+func activeSubscriptionCount(watched []session.VariableNodeInspection) int {
+	count := 0
+	for _, item := range watched {
+		if item.Subscription != nil {
+			count++
+		}
+	}
+	return count
+}
+
+func diagnosticsEndpoint(connectedEndpoint, typedEndpoint string) string {
+	if strings.TrimSpace(connectedEndpoint) != "" {
+		return connectedEndpoint
+	}
+	return typedEndpoint
+}
+
+func pathOrDot(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return "."
+	}
+	return path
+}
+
+func serverConnectionStatusText(status ServerConnectionStatus) string {
+	switch status {
+	case ServerConnectionIdle:
+		return "Idle"
+	case ServerConnectionNeedsEndpoint:
+		return "Needs Endpoint"
+	case ServerConnectionDiscovering:
+		return "Discovering"
+	case ServerConnectionDiscoveryFailed:
+		return "Discovery Failed"
+	case ServerConnectionDiscovered:
+		return "Discovered"
+	case ServerConnectionConnecting:
+		return "Connecting"
+	case ServerConnectionConnected:
+		return "Connected"
+	case ServerConnectionFailed:
+		return "Failed"
+	case ServerConnectionEndpointRequiresCredentials:
+		return "Endpoint Requires Credentials"
+	case ServerConnectionSelectingAuthType:
+		return "Selecting Authentication Type"
+	case ServerConnectionEnteringCredentials:
+		return "Entering Credentials"
+	default:
+		return fmt.Sprintf("Unknown (%d)", status)
+	}
 }
 
 func appendMarkdownField(b *strings.Builder, label, value string) {
